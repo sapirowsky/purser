@@ -6,8 +6,7 @@ and secret values sync peer-to-peer between your devices while staying invisible
 Built with Rust. Rust good.
 
 > Status: **early scaffold.** Nothing is implemented yet — this is the workspace skeleton with
-> the architecture's two load-bearing seams baked into the schema. Design and rationale live in
-> the separate planning repo (`futureos`): see `docs/plans/purser_v4_plan.md`.
+> the architecture's two load-bearing seams baked into the schema. 
 
 ## What it will do
 
