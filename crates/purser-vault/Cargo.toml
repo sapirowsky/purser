@@ -1,0 +1,13 @@
+[package]
+name = "purser-vault"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Purser vault: encryption at rest + OS keyring integration."
+
+[dependencies]
+purser-core = { workspace = true }
+# chacha20poly1305 = "0.10"   # XChaCha20-Poly1305 for values at rest
+# keyring = "3"               # Keychain / Secret Service / Win Cred Mgr
+# zeroize = "1"               # scrub credential buffers after use

@@ -1,0 +1,14 @@
+[package]
+name = "purser-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Purser daemon: the resident process (injection, MCP, audit, sync loop)."
+
+[dependencies]
+purser-core = { workspace = true }
+purser-store = { workspace = true }
+purser-vault = { workspace = true }
+purser-sync = { workspace = true }
+purser-mcp = { workspace = true }

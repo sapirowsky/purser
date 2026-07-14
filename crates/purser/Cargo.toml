@@ -1,0 +1,21 @@
+[package]
+name = "purser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "One-command dev-environment sync with agent-blind secrets."
+readme = "../../README.md"
+keywords = ["secrets", "sync", "cli", "devtools", "agents"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "purser"
+path = "src/main.rs"
+
+[dependencies]
+# Wire these up as the crates fill in (kept empty so `purser` publishes standalone
+# to hold the crates.io name):
+# purser-core = { workspace = true }
+# purser-daemon = { workspace = true }
+# clap = { version = "4", features = ["derive"] }

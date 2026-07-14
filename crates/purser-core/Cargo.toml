@@ -1,0 +1,10 @@
+[package]
+name = "purser-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Purser core types: opaque identity (seam 1) and capabilities (seam 2)."
+
+[dependencies]
+# ulid = "1"   # add when wiring real ID generation

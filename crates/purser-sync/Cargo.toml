@@ -1,0 +1,12 @@
+[package]
+name = "purser-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Purser sync: peer-to-peer transport, device pairing, replication."
+
+[dependencies]
+purser-core = { workspace = true }
+# iroh = "0.x"    # QUIC + NAT hole-punching (seam 3 transport)
+# tokio = { version = "1", features = ["full"] }

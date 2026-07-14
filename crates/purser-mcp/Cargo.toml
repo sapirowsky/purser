@@ -1,0 +1,11 @@
+[package]
+name = "purser-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Purser MCP: metadata-only tools exposed to AI agents (no value path)."
+
+[dependencies]
+purser-core = { workspace = true }
+# rmcp = "0.x"   # official Rust MCP SDK (or a small JSON-RPC-over-stdio server)
