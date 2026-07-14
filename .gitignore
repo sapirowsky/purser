@@ -1,3 +1,6 @@
 /target
 **/*.rs.bk
 *.pdb
+
+# Local, private planning notes (mirrored from the private futureos repo). Never published.
+.plans/
