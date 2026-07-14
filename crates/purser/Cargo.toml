@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "One-command dev-environment sync with agent-blind secrets."
-readme = "../../README.md"
+readme = "README.md"
 keywords = ["secrets", "sync", "cli", "devtools", "agents"]
 categories = ["command-line-utilities", "development-tools"]
 
