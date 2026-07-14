@@ -8,4 +8,7 @@ description = "Purser local store: SQLite migrations + repositories."
 
 [dependencies]
 purser-core = { workspace = true }
-# rusqlite = { version = "0.31", features = ["bundled"] }   # add when wiring the DB
+dirs = { workspace = true }
+rusqlite = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }

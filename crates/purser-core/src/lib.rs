@@ -14,6 +14,13 @@
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Id(pub String);
 
+impl Id {
+    /// Generate a new opaque, lexicographically sortable identifier.
+    pub fn generate() -> Self {
+        Self(ulid::Ulid::new().to_string())
+    }
+}
+
 impl std::fmt::Display for Id {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -52,4 +59,17 @@ pub struct Grant {
     pub capability: Capability,
     pub resource_type: ResourceType,
     pub resource_id: Id,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_ids_are_valid_distinct_ulids() {
+        let first = Id::generate();
+        let second = Id::generate();
+        assert_ne!(first, second);
+        assert!(ulid::Ulid::from_string(&first.0).is_ok());
+    }
 }

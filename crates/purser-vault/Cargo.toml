@@ -8,6 +8,8 @@ description = "Purser vault: encryption at rest + OS keyring integration."
 
 [dependencies]
 purser-core = { workspace = true }
-# chacha20poly1305 = "0.10"   # XChaCha20-Poly1305 for values at rest
-# keyring = "3"               # Keychain / Secret Service / Win Cred Mgr
-# zeroize = "1"               # scrub credential buffers after use
+chacha20poly1305 = { workspace = true }
+keyring = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }

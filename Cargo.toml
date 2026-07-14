@@ -30,3 +30,15 @@ purser-vault = { path = "crates/purser-vault", version = "0.0.1" }
 purser-sync = { path = "crates/purser-sync", version = "0.0.1" }
 purser-daemon = { path = "crates/purser-daemon", version = "0.0.1" }
 purser-mcp = { path = "crates/purser-mcp", version = "0.0.1" }
+anyhow = "1.0.100"
+chacha20poly1305 = "0.10.1"
+clap = { version = "4.5.54", features = ["derive"] }
+dirs = "6.0.0"
+keyring = { version = "3.6.3", features = ["windows-native"] }
+rand = "0.8.5"
+rpassword = "7.4.0"
+rusqlite = { version = "0.37.0", features = ["bundled"] }
+sha2 = "0.10.9"
+thiserror = "2.0.17"
+ulid = "1.2.1"
+zeroize = "1.8.2"

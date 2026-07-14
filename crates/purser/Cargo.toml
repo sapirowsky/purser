@@ -14,8 +14,9 @@ name = "purser"
 path = "src/main.rs"
 
 [dependencies]
-# Wire these up as the crates fill in (kept empty so `purser` publishes standalone
-# to hold the crates.io name):
-# purser-core = { workspace = true }
-# purser-daemon = { workspace = true }
-# clap = { version = "4", features = ["derive"] }
+anyhow = { workspace = true }
+clap = { workspace = true }
+purser-store = { workspace = true }
+purser-vault = { workspace = true }
+rpassword = { workspace = true }
+zeroize = { workspace = true }
