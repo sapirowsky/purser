@@ -6,7 +6,8 @@ use rand::{rngs::OsRng, RngCore};
 use zeroize::{Zeroize, Zeroizing};
 
 const SERVICE: &str = "purser";
-const ACCOUNT: &str = "vault-key";
+const VAULT_KEY_ACCOUNT: &str = "vault-key";
+const DEVICE_KEY_ACCOUNT: &str = "device-key";
 const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 24;
 
@@ -16,6 +17,10 @@ pub enum VaultError {
     Keyring(#[from] keyring::Error),
     #[error("Purser's stored vault key is invalid")]
     InvalidStoredKey,
+    #[error("this device already has a vault key; pairing will not overwrite it")]
+    VaultKeyAlreadyExists,
+    #[error("this device does not have a vault key to transfer")]
+    VaultKeyMissing,
     #[error("encrypted secret data is malformed")]
     MalformedCiphertext,
     #[error("secret encryption or authentication failed")]
@@ -26,7 +31,7 @@ pub type Result<T> = std::result::Result<T, VaultError>;
 
 /// Encrypt bytes with the persistent OS-keyring key. The result is nonce || ciphertext.
 pub fn encrypt(plaintext: &[u8]) -> Result<Vec<u8>> {
-    let mut key = load_or_create_key()?;
+    let mut key = load_or_create_key(VAULT_KEY_ACCOUNT)?;
     let result = encrypt_with_key(&key, plaintext);
     key.zeroize();
     result
@@ -34,16 +39,62 @@ pub fn encrypt(plaintext: &[u8]) -> Result<Vec<u8>> {
 
 /// Authenticate and decrypt bytes into a buffer that scrubs itself on drop.
 pub fn decrypt(encrypted: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-    let mut key = load_or_create_key()?;
+    let mut key = load_or_create_key(VAULT_KEY_ACCOUNT)?;
     let result = decrypt_with_key(&key, encrypted).map(Zeroizing::new);
     key.zeroize();
     result
 }
 
-fn load_or_create_key() -> Result<[u8; KEY_LEN]> {
+/// This device's networking identity: a key that is independent of the vault key and,
+/// unlike it, never leaves the machine. Pairing hands a peer the vault key; handing over
+/// device identity too would let a peer impersonate this device.
+pub fn device_key() -> Result<Zeroizing<[u8; KEY_LEN]>> {
+    load_or_create_key(DEVICE_KEY_ACCOUNT)
+}
+
+/// Report whether this scoped device already owns a vault key without creating one.
+pub fn vault_key_exists() -> Result<bool> {
+    Ok(load_existing_key(VAULT_KEY_ACCOUNT)?.is_some())
+}
+
+/// Load the vault key for an authorized pairing response. Unlike encryption, this never
+/// creates a key: an enrolling device must actually hold the key it claims to transfer.
+pub fn export_vault_key() -> Result<Zeroizing<[u8; KEY_LEN]>> {
+    load_existing_key(VAULT_KEY_ACCOUNT)?.ok_or(VaultError::VaultKeyMissing)
+}
+
+/// Install received vault key bytes only into an empty scoped account. This function
+/// must never use keyring's overwrite behavior for an account observed to exist.
+pub fn install_vault_key_if_absent(key: &[u8; KEY_LEN]) -> Result<()> {
+    let account = scoped_account(VAULT_KEY_ACCOUNT, purser_core::device_scope().as_deref());
+    let entry = keyring::Entry::new(SERVICE, &account)?;
+    install_if_absent(
+        || match entry.get_secret() {
+            Ok(mut stored) => {
+                stored.zeroize();
+                Ok(true)
+            }
+            Err(keyring::Error::NoEntry) => Ok(false),
+            Err(error) => Err(VaultError::Keyring(error)),
+        },
+        || entry.set_secret(key).map_err(VaultError::Keyring),
+    )
+}
+
+/// Qualify a keyring account with the device scope, so a virtual device never shares
+/// the real device's keys.
+fn scoped_account(account: &str, scope: Option<&str>) -> String {
+    match scope {
+        Some(scope) => format!("{account}:{scope}"),
+        None => account.to_owned(),
+    }
+}
+
+fn load_or_create_key(account: &str) -> Result<Zeroizing<[u8; KEY_LEN]>> {
     // TODO: Add an encrypted-key-file fallback for systems (notably some WSL setups)
     // without a working Secret Service. Keyring errors intentionally remain errors today.
-    let entry = keyring::Entry::new(SERVICE, ACCOUNT)?;
+    let account = scoped_account(account, purser_core::device_scope().as_deref());
+    let entry = keyring::Entry::new(SERVICE, &account)?;
     match entry.get_secret() {
         Ok(mut stored) => {
             if stored.len() != KEY_LEN {
@@ -53,12 +104,12 @@ fn load_or_create_key() -> Result<[u8; KEY_LEN]> {
             let mut key = [0_u8; KEY_LEN];
             key.copy_from_slice(&stored);
             stored.zeroize();
-            Ok(key)
+            Ok(Zeroizing::new(key))
         }
         Err(keyring::Error::NoEntry) => {
-            let mut key = [0_u8; KEY_LEN];
-            OsRng.fill_bytes(&mut key);
-            if let Err(error) = entry.set_secret(&key) {
+            let mut key = Zeroizing::new([0_u8; KEY_LEN]);
+            OsRng.fill_bytes(&mut key[..]);
+            if let Err(error) = entry.set_secret(&key[..]) {
                 key.zeroize();
                 return Err(VaultError::Keyring(error));
             }
@@ -66,6 +117,35 @@ fn load_or_create_key() -> Result<[u8; KEY_LEN]> {
         }
         Err(error) => Err(VaultError::Keyring(error)),
     }
+}
+
+fn load_existing_key(account: &str) -> Result<Option<Zeroizing<[u8; KEY_LEN]>>> {
+    let account = scoped_account(account, purser_core::device_scope().as_deref());
+    let entry = keyring::Entry::new(SERVICE, &account)?;
+    match entry.get_secret() {
+        Ok(mut stored) => {
+            if stored.len() != KEY_LEN {
+                stored.zeroize();
+                return Err(VaultError::InvalidStoredKey);
+            }
+            let mut key = [0_u8; KEY_LEN];
+            key.copy_from_slice(&stored);
+            stored.zeroize();
+            Ok(Some(Zeroizing::new(key)))
+        }
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(VaultError::Keyring(error)),
+    }
+}
+
+fn install_if_absent(
+    exists: impl FnOnce() -> Result<bool>,
+    install: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if exists()? {
+        return Err(VaultError::VaultKeyAlreadyExists);
+    }
+    install()
 }
 
 fn encrypt_with_key(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
@@ -106,6 +186,27 @@ mod tests {
     }
 
     #[test]
+    fn a_device_scope_separates_every_key_from_the_real_devices() {
+        assert_eq!(scoped_account(VAULT_KEY_ACCOUNT, None), "vault-key");
+        assert_eq!(scoped_account(DEVICE_KEY_ACCOUNT, None), "device-key");
+
+        // The vault key must be scoped too, not just the device key: two virtual devices
+        // sharing one vault key would make pairing a no-op and prove nothing.
+        assert_eq!(
+            scoped_account(VAULT_KEY_ACCOUNT, Some("mac-sim")),
+            "vault-key:mac-sim"
+        );
+        assert_eq!(
+            scoped_account(DEVICE_KEY_ACCOUNT, Some("mac-sim")),
+            "device-key:mac-sim"
+        );
+        assert_ne!(
+            scoped_account(DEVICE_KEY_ACCOUNT, Some("mac-sim")),
+            scoped_account(DEVICE_KEY_ACCOUNT, Some("other")),
+        );
+    }
+
+    #[test]
     fn wrong_key_and_corruption_fail_authentication() {
         let key = [11_u8; KEY_LEN];
         let encrypted = encrypt_with_key(&key, b"authenticated secret").unwrap();
@@ -116,5 +217,20 @@ mod tests {
         corrupted[last] ^= 1;
         assert!(decrypt_with_key(&key, &corrupted).is_err());
         assert!(decrypt_with_key(&key, b"short").is_err());
+    }
+
+    #[test]
+    fn installing_a_vault_key_never_calls_overwriting_setter() {
+        let setter_called = std::cell::Cell::new(false);
+        let result = install_if_absent(
+            || Ok(true),
+            || {
+                setter_called.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(result, Err(VaultError::VaultKeyAlreadyExists)));
+        assert!(!setter_called.get(), "existing vault key was overwritten");
     }
 }

@@ -8,6 +8,24 @@
 //!     over secrets, but the shape already fits files, commits, and branches — which is
 //!     the permissioned-git future.
 
+/// Names a separate Purser identity on one machine, for exercising multi-device sync
+/// without a second physical box. Unset — the normal case — means the real device.
+///
+/// A scope must move the keyring accounts and the database together: a virtual device
+/// reading the real device's rows with a virtual device's keys would decrypt nothing.
+pub const DEVICE_SCOPE_VAR: &str = "PURSER_DEVICE";
+
+/// The device scope in effect, if any. Blank is treated as unset.
+pub fn device_scope() -> Option<String> {
+    scope_from(std::env::var(DEVICE_SCOPE_VAR).ok().as_deref())
+}
+
+fn scope_from(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .map(str::to_owned)
+}
+
 /// An opaque, permanent identifier (a ULID rendered as text).
 ///
 /// Identity is never a path. A path/remote is one projection of the thing this Id names.
@@ -64,6 +82,16 @@ pub struct Grant {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_blank_device_scope_means_the_real_device() {
+        // Guards against `PURSER_DEVICE=` (set but empty) quietly creating a second
+        // identity whose keys and database the real device can never see again.
+        assert_eq!(scope_from(None), None);
+        assert_eq!(scope_from(Some("")), None);
+        assert_eq!(scope_from(Some("   ")), None);
+        assert_eq!(scope_from(Some(" mac-sim ")), Some("mac-sim".to_owned()));
+    }
 
     #[test]
     fn generated_ids_are_valid_distinct_ulids() {

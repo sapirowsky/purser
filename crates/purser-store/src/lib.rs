@@ -24,6 +24,8 @@ pub enum StoreError {
     CreateDataDirectory(#[source] std::io::Error),
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
+    #[error("this device cannot be recorded as its own paired peer")]
+    CannotPairSelf,
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -57,6 +59,15 @@ pub struct Project {
     pub local_path: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Device {
+    pub id: String,
+    pub label: String,
+    pub public_key: Vec<u8>,
+    pub is_self: bool,
+    pub paired_at: String,
+}
+
 pub struct Store {
     connection: Connection,
 }
@@ -65,7 +76,11 @@ impl Store {
     /// Open the per-user production database and apply pending migrations.
     pub fn open() -> Result<Self> {
         let base = dirs::data_local_dir().ok_or(StoreError::NoDataDirectory)?;
-        let directory = base.join("purser");
+        let mut directory = base.join("purser");
+        // A scoped device keeps its own database, alongside its own keyring accounts.
+        if let Some(scope) = purser_core::device_scope() {
+            directory = directory.join("devices").join(scope);
+        }
         std::fs::create_dir_all(&directory).map_err(StoreError::CreateDataDirectory)?;
         Self::open_at(directory.join("purser.db"))
     }
@@ -173,6 +188,15 @@ impl Store {
             ],
         )?;
         Ok(version)
+    }
+
+    /// Pairing must not install a different vault key over ciphertext already stored here.
+    pub fn has_secret_versions(&self) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM secret_versions LIMIT 1)",
+            [],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn list_secrets(&self, profile: &str) -> Result<Vec<SecretSummary>> {
@@ -292,6 +316,94 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// Record this installation's identity, preserving exactly one self row.
+    pub fn upsert_self_device(&self, label: &str, public_key: &[u8]) -> Result<String> {
+        let existing_self: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT id FROM devices WHERE is_self = 1 ORDER BY rowid LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let existing_key: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT id FROM devices WHERE public_key = ?1 ORDER BY rowid LIMIT 1",
+                [public_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let id = existing_self
+            .or(existing_key)
+            .unwrap_or_else(|| Id::generate().0);
+        let updated = self.connection.execute(
+            "UPDATE devices SET label = ?1, public_key = ?2, is_self = 1 WHERE id = ?3",
+            params![label, public_key, id],
+        )?;
+        if updated == 0 {
+            self.connection.execute(
+                "INSERT INTO devices(id, label, public_key, is_self, paired_at)
+                 VALUES (?1, ?2, ?3, 1, ?4)",
+                params![id, label, public_key, timestamp()],
+            )?;
+        }
+        self.connection
+            .execute("DELETE FROM devices WHERE is_self = 1 AND id != ?1", [&id])?;
+        Ok(id)
+    }
+
+    pub fn list_devices(&self) -> Result<Vec<Device>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, label, public_key, is_self, paired_at
+             FROM devices ORDER BY is_self DESC, label COLLATE NOCASE, rowid",
+        )?;
+        let rows = statement.query_map([], device_from_row)?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn find_device_by_public_key(&self, public_key: &[u8]) -> Result<Option<Device>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT id, label, public_key, is_self, paired_at
+                 FROM devices WHERE public_key = ?1 ORDER BY rowid LIMIT 1",
+                [public_key],
+                device_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Record a successfully paired peer without ever changing the self-device row.
+    pub fn upsert_paired_device(&self, label: &str, public_key: &[u8]) -> Result<String> {
+        let existing: Option<(String, bool)> = self
+            .connection
+            .query_row(
+                "SELECT id, is_self FROM devices WHERE public_key = ?1 ORDER BY rowid LIMIT 1",
+                [public_key],
+                |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0)),
+            )
+            .optional()?;
+        if let Some((_id, true)) = existing {
+            return Err(StoreError::CannotPairSelf);
+        }
+        if let Some((id, false)) = existing {
+            self.connection.execute(
+                "UPDATE devices SET label = ?1, paired_at = ?2 WHERE id = ?3",
+                params![label, timestamp(), id],
+            )?;
+            return Ok(id);
+        }
+        let id = Id::generate().0;
+        self.connection.execute(
+            "INSERT INTO devices(id, label, public_key, is_self, paired_at)
+             VALUES (?1, ?2, ?3, 0, ?4)",
+            params![id, label, public_key, timestamp()],
+        )?;
+        Ok(id)
+    }
+
     pub fn open_session(&self, kind: &str, scope: Option<&str>) -> Result<String> {
         let id = Id::generate().0;
         self.connection.execute(
@@ -394,6 +506,16 @@ fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         package_manager: row.get(4)?,
         profile_ref: row.get(5)?,
         local_path: row.get(6)?,
+    })
+}
+
+fn device_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
+    Ok(Device {
+        id: row.get(0)?,
+        label: row.get(1)?,
+        public_key: row.get(2)?,
+        is_self: row.get::<_, i64>(3)? != 0,
+        paired_at: row.get(4)?,
     })
 }
 
@@ -519,6 +641,55 @@ mod tests {
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].name, "second");
         assert_eq!(projects[0].package_manager.as_deref(), Some("pnpm"));
+    }
+
+    #[test]
+    fn self_device_upsert_is_idempotent() {
+        let store = Store::open_in_memory().unwrap();
+        let first = store
+            .upsert_self_device("first label", &[3_u8; 32])
+            .unwrap();
+        let second = store
+            .upsert_self_device("updated label", &[3_u8; 32])
+            .unwrap();
+        let third = store
+            .upsert_self_device("rotated key", &[4_u8; 32])
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(second, third);
+        assert_eq!(store.list_devices().unwrap().len(), 1);
+        assert_eq!(store.list_devices().unwrap()[0].label, "rotated key");
+        assert!(
+            store
+                .find_device_by_public_key(&[4_u8; 32])
+                .unwrap()
+                .unwrap()
+                .is_self
+        );
+    }
+
+    #[test]
+    fn paired_peer_upsert_never_converts_the_self_row() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_self_device("self", &[3_u8; 32]).unwrap();
+        assert!(matches!(
+            store.upsert_paired_device("not-self", &[3_u8; 32]),
+            Err(StoreError::CannotPairSelf)
+        ));
+        let devices = store.list_devices().unwrap();
+        assert_eq!(devices.len(), 1);
+        assert!(devices[0].is_self);
+        assert_eq!(devices[0].label, "self");
+    }
+
+    #[test]
+    fn secret_version_presence_is_an_explicit_pairing_guard() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(!store.has_secret_versions().unwrap());
+        let id = store.upsert_secret("TOKEN", "local", None, true).unwrap();
+        store.add_secret_version(&id, b"opaque").unwrap();
+        assert!(store.has_secret_versions().unwrap());
     }
 
     #[test]

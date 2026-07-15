@@ -3,6 +3,10 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use purser_store::{AuditEvent, Project, Store};
+use purser_sync::{
+    accept_pairing, bind_pairing, connect_pairing, request_pairing, serve_pairing, IrohTransport,
+    PairingCode, PairingKeyMaterial, Record, Transport,
+};
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
@@ -11,12 +15,13 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 use zeroize::{Zeroize, Zeroizing};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const FOOTER: &str = "built with Rust. Rust good. 🦀";
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(
     name = "purser",
     version,
@@ -29,7 +34,7 @@ struct Cli {
     command: TopCommand,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 enum TopCommand {
     /// Encrypt a dotenv file, then remove the plaintext source.
     Import(ImportArgs),
@@ -45,6 +50,8 @@ enum TopCommand {
     Audit(AuditArgs),
     /// Register and inspect project metadata.
     Project(ProjectArgs),
+    /// Inspect this device or prove peer-to-peer connectivity.
+    Device(DeviceArgs),
     /// Show registered projects and secret configuration status.
     Status,
     /// Clone missing projects and install their dependencies.
@@ -141,6 +148,29 @@ struct ProjectRemoveArgs {
     path: PathBuf,
 }
 
+#[derive(Args)]
+struct DeviceArgs {
+    /// Override the hostname stored as this device's label.
+    #[arg(long, global = true)]
+    label: Option<String>,
+    #[command(subcommand)]
+    command: DeviceCommand,
+}
+
+#[derive(Subcommand)]
+enum DeviceCommand {
+    /// Print this device's persistent iroh identity.
+    Info,
+    /// List devices recorded in the local database.
+    List,
+    /// Accept unauthenticated hello probes until Ctrl-C.
+    Listen,
+    /// Dial a NodeId and measure an unauthenticated hello round-trip.
+    Connect { node_id: String },
+    /// Show a one-time enrollment code, or use one to enroll this device.
+    Pair { code: Option<String> },
+}
+
 #[derive(Debug, Args)]
 struct UpArgs {
     #[arg(long)]
@@ -169,13 +199,15 @@ enum AuditCommand {
 }
 
 fn main() {
-    let raw: Vec<OsString> = std::env::args_os().collect();
-    if raw.get(1).and_then(|value| value.to_str()) == Some("rust") {
+    // Inspect only argv[1]. Collecting every argument here would retain a second copy of
+    // an entered pairing code for the lifetime of the process.
+    let first_argument = std::env::args_os().nth(1);
+    if first_argument.as_ref().and_then(|value| value.to_str()) == Some("rust") {
         println!("good.");
         return;
     }
     if matches!(
-        raw.get(1).and_then(|value| value.to_str()),
+        first_argument.as_ref().and_then(|value| value.to_str()),
         Some("--version" | "-V")
     ) {
         println!("purser {VERSION}");
@@ -204,11 +236,237 @@ fn execute(cli: Cli) -> Result<i32> {
         TopCommand::Agent(args) => agent(args),
         TopCommand::Audit(args) => audit(args),
         TopCommand::Project(args) => project(args),
+        TopCommand::Device(args) => device(args),
         TopCommand::Status => status(),
         TopCommand::Up(args) => up(args),
         TopCommand::Hook(args) => hook(args),
         TopCommand::InProject => in_project(),
     }
+}
+
+struct DeviceIdentity {
+    key: iroh::SecretKey,
+    label: String,
+}
+
+fn device(args: DeviceArgs) -> Result<i32> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("could not start the device networking runtime")?
+        .block_on(device_async(args))
+}
+
+async fn device_async(args: DeviceArgs) -> Result<i32> {
+    let identity = ensure_device_identity(args.label)?;
+    match args.command {
+        DeviceCommand::Info => {
+            println!("NodeId: {}", identity.key.public());
+            println!("Label: {}", identity.label);
+        }
+        DeviceCommand::List => {
+            for device in Store::open()?.list_devices()? {
+                let node_id = iroh::PublicKey::try_from(device.public_key.as_slice())
+                    .context("a stored device has an invalid iroh public key")?;
+                let marker = if device.is_self { " (self)" } else { "" };
+                println!("{}  {}{}", node_id, device.label, marker);
+            }
+        }
+        DeviceCommand::Listen => device_listen(identity.key).await?,
+        DeviceCommand::Connect { node_id } => device_connect(identity.key, &node_id).await?,
+        DeviceCommand::Pair { code } => match code {
+            Some(code) => device_pair_join(identity, code).await?,
+            None => device_pair_serve(identity).await?,
+        },
+    }
+    Ok(0)
+}
+
+fn ensure_device_identity(label_override: Option<String>) -> Result<DeviceIdentity> {
+    let key_bytes = purser_vault::device_key()?;
+    let key = iroh::SecretKey::from_bytes(&key_bytes);
+    let store = Store::open()?;
+    let stored = store.find_device_by_public_key(key.public().as_bytes())?;
+    let label = label_override
+        .or_else(|| stored.map(|device| device.label))
+        .unwrap_or_else(machine_label);
+    store.upsert_self_device(&label, key.public().as_bytes())?;
+    Ok(DeviceIdentity { key, label })
+}
+
+fn machine_label() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or_else(|| "unknown-device".to_owned())
+}
+
+async fn device_listen(key: iroh::SecretKey) -> Result<()> {
+    let endpoint = IrohTransport::bind(key).await?;
+    eprintln!("WARNING: THIS CHANNEL IS UNAUTHENTICATED.");
+    eprintln!("Any peer is accepted in transport step 3a. Pairing and authorization land in 3b.");
+    eprintln!("No vault data, database rows, or sensitive values are sent by this command.");
+    if tokio::time::timeout(Duration::from_secs(15), endpoint.online())
+        .await
+        .is_err()
+    {
+        eprintln!("warning: no relay became reachable; direct local connections may still work");
+    }
+    println!("Listening as {}", endpoint.id());
+    std::io::stdout().flush()?;
+
+    loop {
+        tokio::select! {
+            // One peer must never take the listener down with it: a hangup, a malformed
+            // frame, or a hostile probe is that peer's problem, reported and survived.
+            // Only losing the endpoint itself ends the loop.
+            result = IrohTransport::accept(&endpoint) => {
+                let (transport, peer) = result.context("the iroh endpoint stopped accepting")?;
+                println!("Connected peer: {peer}");
+                tokio::select! {
+                    result = async {
+                        let hello = transport.recv().await?;
+                        transport.send(&hello).await
+                    } => {
+                        match result {
+                            Ok(()) => println!("Hello echoed to {peer}"),
+                            Err(error) => eprintln!("warning: peer {peer} hello failed: {error:#}"),
+                        }
+                    }
+                    result = tokio::signal::ctrl_c() => {
+                        result.context("could not listen for Ctrl-C")?;
+                        break;
+                    }
+                }
+                std::io::stdout().flush()?;
+            }
+            result = tokio::signal::ctrl_c() => {
+                result.context("could not listen for Ctrl-C")?;
+                break;
+            }
+        }
+    }
+    endpoint.close().await;
+    Ok(())
+}
+
+async fn device_connect(key: iroh::SecretKey, node_id: &str) -> Result<()> {
+    let peer: iroh::PublicKey = node_id
+        .parse()
+        .context("NODE_ID must be an iroh public key")?;
+    let endpoint = IrohTransport::bind(key).await?;
+    let transport = IrohTransport::connect(&endpoint, peer).await?;
+    let hello = Record {
+        id: "purser-3a-hello".to_owned(),
+        version: 1,
+        ciphertext: b"hello".to_vec(),
+    };
+    let started = Instant::now();
+    transport.send(&hello).await?;
+    let echoed = transport.recv().await?;
+    if echoed != hello {
+        bail!("peer returned an invalid hello response");
+    }
+    println!(
+        "Connected to {}: hello round-trip succeeded in {:.2?}",
+        transport.peer_id(),
+        started.elapsed()
+    );
+    endpoint.close().await;
+    Ok(())
+}
+
+const PAIRING_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+async fn device_pair_serve(identity: DeviceIdentity) -> Result<()> {
+    let endpoint = bind_pairing(identity.key).await?;
+    if tokio::time::timeout(Duration::from_secs(15), endpoint.online())
+        .await
+        .is_err()
+    {
+        eprintln!("warning: no relay became reachable; direct local connections may still work");
+    }
+    let (mut encoded, code) = PairingCode::generate(endpoint.id());
+    // Stdout contains exactly the copy/pasteable code and no other pairing material.
+    println!("{}", encoded.as_str());
+    std::io::stdout().flush()?;
+    encoded.zeroize();
+    eprintln!("Pairing window open for 10 minutes; it closes after one successful enrollment.");
+
+    let deadline = tokio::time::Instant::now() + PAIRING_WINDOW;
+    loop {
+        let connection = match tokio::time::timeout_at(deadline, accept_pairing(&endpoint)).await {
+            Ok(result) => result?,
+            Err(_) => {
+                endpoint.close().await;
+                bail!("pairing window expired");
+            }
+        };
+        let attempt = tokio::time::timeout_at(
+            deadline,
+            serve_pairing(connection, endpoint.id(), &code, &identity.label, || {
+                // This closure is not called until the peer's HMAC has verified.
+                let key = purser_vault::export_vault_key()
+                    .context("could not load this device's vault key after authorization")?;
+                Ok(PairingKeyMaterial::from_zeroizing(key))
+            }),
+        )
+        .await;
+        match attempt {
+            Err(_) => {
+                endpoint.close().await;
+                bail!("pairing window expired");
+            }
+            Ok(Ok(peer)) => {
+                Store::open()?.upsert_paired_device(&peer.label, peer.id.as_bytes())?;
+                println!("Paired device: {}  {}", peer.id, peer.label);
+                endpoint.close().await;
+                return Ok(());
+            }
+            Ok(Err(error)) => {
+                eprintln!("warning: pairing attempt refused: {error:#}");
+                if tokio::time::Instant::now() >= deadline {
+                    endpoint.close().await;
+                    bail!("pairing window expired");
+                }
+            }
+        }
+    }
+}
+
+async fn device_pair_join(identity: DeviceIdentity, mut encoded: String) -> Result<()> {
+    refuse_pairing_over_existing_state()?;
+    let decoded = PairingCode::decode(&encoded);
+    encoded.zeroize();
+    let code = decoded.context("invalid pairing code")?;
+    let endpoint = bind_pairing(identity.key).await?;
+    let connection = connect_pairing(&endpoint, code.peer()).await?;
+    let received = request_pairing(connection, endpoint.id(), &code, &identity.label).await?;
+
+    // Recheck immediately before the irreversible local write in case another process
+    // changed this scoped device while the network handshake was in progress.
+    refuse_pairing_over_existing_state()?;
+    purser_vault::install_vault_key_if_absent(received.key_material.as_bytes())?;
+    Store::open()?.upsert_paired_device(&received.peer.label, received.peer.id.as_bytes())?;
+    println!("Paired with {}  {}", received.peer.id, received.peer.label);
+    endpoint.close().await;
+    Ok(())
+}
+
+fn refuse_pairing_over_existing_state() -> Result<()> {
+    if Store::open()?.has_secret_versions()? {
+        bail!(
+            "pairing refused: this device already stores encrypted secret versions; \
+             replacing its vault key would make them permanently unreadable"
+        );
+    }
+    if purser_vault::vault_key_exists()? {
+        bail!(
+            "pairing refused: this device already has a vault key and it will not be overwritten"
+        );
+    }
+    Ok(())
 }
 
 fn in_project() -> Result<i32> {
@@ -1538,5 +1796,36 @@ mod tests {
             .find(|subcommand| subcommand.get_name() == "_in-project")
             .unwrap();
         assert!(probe.is_hide_set());
+    }
+
+    #[test]
+    fn device_commands_follow_the_nested_clap_shape() {
+        let info =
+            Cli::try_parse_from(["purser", "device", "info", "--label", "workstation"]).unwrap();
+        match info.command {
+            TopCommand::Device(DeviceArgs {
+                label,
+                command: DeviceCommand::Info,
+            }) => assert_eq!(label.as_deref(), Some("workstation")),
+            _ => panic!("device info parsed as the wrong command"),
+        }
+
+        let connect = Cli::try_parse_from(["purser", "device", "connect", "node-id"]).unwrap();
+        assert!(matches!(
+            connect.command,
+            TopCommand::Device(DeviceArgs {
+                command: DeviceCommand::Connect { node_id },
+                ..
+            }) if node_id == "node-id"
+        ));
+
+        let pair = Cli::try_parse_from(["purser", "device", "pair", "opaque-code"]).unwrap();
+        assert!(matches!(
+            pair.command,
+            TopCommand::Device(DeviceArgs {
+                label: None,
+                command: DeviceCommand::Pair { code: Some(code) },
+            }) if code == "opaque-code"
+        ));
     }
 }
