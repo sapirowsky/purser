@@ -22,17 +22,50 @@ one_line: "Where Purser stands and exactly what to do next."
   don't, outside purser it passes through even with purser off PATH entirely.
 - **Not built yet:** device sync (Week 3), WSL keyring fallback + MCP metadata tools (Week 4).
 
-## ▶ START HERE: pass Gate B yourself
+## ⚠ 2026-07-15 — the agent-blind half is CUT (Gate C, called early)
 
-Week 2's code is done, but **Gate B is a usage test, not a code test** — the plan says it
-passes only when *you* stop doing the manual clone/env dance. Nobody can do that for you.
+The owner ran the whole thing end-to-end and called it:
 
-1. Merge `week2-manifest-up` into `main` (it's committed there, not merged).
-2. Register your real projects: `purser project add <path> --profile <name>`.
-3. Install the hook once: add `eval "$(purser hook bash)"` to your rc file
-   (or `purser hook powershell | Out-String | Invoke-Expression` in `$PROFILE`).
-4. Live on it for a few days. If `up` + `hook` are fiddlier than doing it by hand,
-   **simplify before building sync** — that's the gate's whole point.
+> "i dont see myself using this keyvault to hide values from agents especially that it
+> doesn't really hide it because agent is always one command away from showing it. i will
+> use it just with purser import when we have syncing so i don't have to remember about
+> setting up envs in all my devices"
+
+Correct, and the plan already conceded it — `run -- node -e "console.log(process.env.X)"`
+prints the value. Full reasoning: `purser_v4_plan.md` → "Gate C, called early".
+
+```text
+DEAD  MCP metadata tools (Week 4). Further work on `agent --`. The "invisible to AI" claim.
+KEEP  The vault — it is the SYNC SUBSTRATE, not the agent feature. Values cannot replicate
+      between devices without encryption at rest. Cutting agent-blindness does not touch it.
+      Also keep: import / secrets / run / shell / hook / up / manifest / audit.
+NEW   `up --write-env` — opt-in, materializes a real .env from the vault on a fresh machine.
+      Deliberate relaxation of the no-plaintext rule; rails in the plan doc.
+```
+
+**The remaining product is one sentence: bootstrap a machine + have my env already there.**
+Week 3 (sync) is now the only thing between here and done.
+
+## ▶ START HERE: Week 3 — device pairing + p2p replication
+
+This is the half the owner actually wants. Everything else is built.
+
+1. `purser device pair` — one-time code, authenticated handshake (PAKE/Noise over iroh),
+   transfer the vault key over the authenticated channel only.
+2. `purser device list` — trusted devices.
+3. Replication — manifest + secret ciphertext, last-writer-wins per secret version, keep
+   full version history (a bad edit must stay recoverable).
+4. **Gate:** set a secret on one machine, `purser up` on another, it's there.
+
+Keep seam 3 honest: `purser-sync` moves opaque `(id, ciphertext, version)` records and must
+NOT know the word "secret". Transport stays behind a trait so a relay/blob backend can be
+added later without touching callers.
+
+**Known problem to solve in Week 3:** the manifest stores ABSOLUTE local paths, which differ
+per machine by design. Syncing `projects` rows verbatim would put Windows paths on macOS.
+The ULID is identity (seam 1) and the path is a projection — so sync the identity + remote,
+and let each device resolve its own local path. Decide where the projects root lives per
+device (a configured base dir?) before replicating the manifest.
 
 ## Notes from the Week 2 build (worth knowing)
 

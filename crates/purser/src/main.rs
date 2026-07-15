@@ -7,6 +7,8 @@ use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use zeroize::{Zeroize, Zeroizing};
@@ -143,6 +145,9 @@ struct ProjectRemoveArgs {
 struct UpArgs {
     #[arg(long)]
     dry_run: bool,
+    /// WARNING: materialize vault secrets into missing project .env files.
+    #[arg(long)]
+    write_env: bool,
 }
 
 #[derive(Debug, Args)]
@@ -258,12 +263,19 @@ fn project_remove(args: ProjectRemoveArgs) -> Result<i32> {
 }
 
 /// Absolutize without touching the filesystem, so a deleted directory still resolves.
+///
+/// Rebuilding from components normalizes the separators and drops `.` segments, so a path
+/// typed as `C:/foo` matches one the manifest stored as `C:\foo`. Without that, a project
+/// could not be unregistered once its directory was gone — the one time it matters most.
 fn absolute_path(path: &Path) -> Result<PathBuf> {
-    if path.is_absolute() {
-        return Ok(path.to_owned());
-    }
-    let current = std::env::current_dir().context("could not read the current directory")?;
-    Ok(plain_path(current.join(path)))
+    let joined = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()
+            .context("could not read the current directory")?
+            .join(path)
+    };
+    Ok(plain_path(joined.components().collect()))
 }
 
 fn project_add(args: ProjectAddArgs) -> Result<i32> {
@@ -343,6 +355,8 @@ fn up(args: UpArgs) -> Result<i32> {
     let mut failures = Vec::new();
     for project in &projects {
         println!("{}:", project.name);
+        // A project is reported failed at most once, however many of its steps fail.
+        let mut failed = false;
         match bring_up_project(project, args.dry_run) {
             Ok(actions) if actions.is_empty() => println!("  nothing to do"),
             Ok(actions) => {
@@ -354,8 +368,30 @@ fn up(args: UpArgs) -> Result<i32> {
             // One project failing must not stop the rest of the machine coming up.
             Err(error) => {
                 println!("  FAILED: {error:#}");
-                failures.push(project.name.clone());
+                failed = true;
             }
+        }
+        if args.write_env && project.profile_ref.is_some() {
+            match materialize_project_dotenv(&store, project, args.dry_run) {
+                Ok(DotenvMaterialization::Written(variable_count)) => println!(
+                    "  WARNING: wrote {variable_count} variables to {}",
+                    project_dotenv_path(project)?.display()
+                ),
+                Ok(DotenvMaterialization::WouldWrite(variable_count)) => println!(
+                    "  WARNING: would write {variable_count} variables to {}",
+                    project_dotenv_path(project)?.display()
+                ),
+                Ok(DotenvMaterialization::Skipped(reason)) => {
+                    println!("  skipped .env: {reason}")
+                }
+                Err(error) => {
+                    println!("  FAILED to write .env: {error:#}");
+                    failed = true;
+                }
+            }
+        }
+        if failed {
+            failures.push(project.name.clone());
         }
         report_profile_status(&store, project)?;
     }
@@ -365,6 +401,108 @@ fn up(args: UpArgs) -> Result<i32> {
         eprintln!("Failed projects: {}", failures.join(", "));
         Ok(1)
     }
+}
+
+enum DotenvMaterialization {
+    Written(usize),
+    WouldWrite(usize),
+    Skipped(&'static str),
+}
+
+fn project_dotenv_path(project: &Project) -> Result<PathBuf> {
+    let local_path = project
+        .local_path
+        .as_deref()
+        .ok_or_else(|| anyhow!("project has no local path"))?;
+    Ok(Path::new(local_path).join(".env"))
+}
+
+fn materialize_project_dotenv(
+    store: &Store,
+    project: &Project,
+    dry_run: bool,
+) -> Result<DotenvMaterialization> {
+    let profile = project
+        .profile_ref
+        .as_deref()
+        .ok_or_else(|| anyhow!("project has no profile"))?;
+
+    // Decide to skip BEFORE decrypting, so a skipped project never holds plaintext at all.
+    let dotenv_path = project_dotenv_path(project)?;
+    let directory = dotenv_path
+        .parent()
+        .ok_or_else(|| anyhow!("project path has no parent directory"))?;
+    if !directory.is_dir() {
+        return Ok(DotenvMaterialization::Skipped(
+            "the project directory does not exist",
+        ));
+    }
+    if dotenv_path.exists() {
+        return Ok(DotenvMaterialization::Skipped(
+            "one already exists (delete it to regenerate)",
+        ));
+    }
+
+    let active = store.get_active_versions(profile)?;
+    // Writing an empty .env would be worse than writing nothing: the file's mere existence
+    // makes every later run skip, so secrets added to this profile would never materialize.
+    if active.is_empty() {
+        return Ok(DotenvMaterialization::Skipped(
+            "the profile has no configured secrets",
+        ));
+    }
+    let mut plaintexts = Vec::with_capacity(active.len());
+    for (name, ciphertext) in active {
+        let plaintext = Zeroizing::new(purser_vault::decrypt(&ciphertext)?);
+        std::str::from_utf8(&plaintext).with_context(|| {
+            format!("secret {name} is not valid UTF-8 and cannot be written to a dotenv file")
+        })?;
+        plaintexts.push((name, plaintext));
+    }
+
+    if dry_run {
+        return Ok(DotenvMaterialization::WouldWrite(plaintexts.len()));
+    }
+
+    ensure_ignored(&dotenv_path)?;
+
+    let mut contents = Zeroizing::new(String::new());
+    for (name, plaintext) in &plaintexts {
+        validate_name(name).with_context(|| format!("invalid secret name {name}"))?;
+        let value = std::str::from_utf8(plaintext).expect("validated above");
+        let line = serialize_dotenv_entry(name, value);
+        contents.push_str(&line);
+    }
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = match options.open(&dotenv_path) {
+        Ok(file) => file,
+        // `create_new` is what actually enforces "never overwrite": the earlier exists()
+        // check is only for reporting, and something may have created the file since.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Ok(DotenvMaterialization::Skipped(
+                "one appeared while purser was running",
+            ));
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("could not create {}", dotenv_path.display()));
+        }
+    };
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("could not write {}", dotenv_path.display()))?;
+    contents.zeroize();
+    for (_, plaintext) in &mut plaintexts {
+        plaintext.zeroize();
+    }
+    for (name, _) in &plaintexts {
+        store.append_audit_event(None, "env_written", Some(name), "used")?;
+    }
+
+    Ok(DotenvMaterialization::Written(plaintexts.len()))
 }
 
 /// Clone and rehydrate one project, returning a description of each action taken.
@@ -1004,6 +1142,24 @@ fn ensure_ignored(source: &Path) -> Result<()> {
     Ok(())
 }
 
+fn serialize_dotenv_entry(name: &str, value: &str) -> Zeroizing<String> {
+    let mut output = Zeroizing::new(String::with_capacity(name.len() + value.len() + 4));
+    output.push_str(name);
+    output.push_str("=\"");
+    for character in value.chars() {
+        match character {
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            other => output.push(other),
+        }
+    }
+    output.push_str("\"\n");
+    output
+}
+
 fn parse_dotenv(input: &str) -> Result<Vec<(String, Zeroizing<String>)>> {
     let mut entries = Vec::new();
     for (index, raw_line) in input.lines().enumerate() {
@@ -1139,6 +1295,7 @@ fn exit_code(status: ExitStatus) -> i32 {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMPORARY_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
@@ -1202,6 +1359,43 @@ mod tests {
     }
 
     #[test]
+    fn serialized_dotenv_values_round_trip_identically() {
+        let expected: BTreeMap<_, _> = [
+            ("SPACES", "two words"),
+            ("COMMENT", "kept # not-a-comment"),
+            ("QUOTES", "a \"quote\" and a \\ slash"),
+            ("LINES", "first\nsecond\tcolumn\rend"),
+            ("EMPTY", ""),
+        ]
+        .into_iter()
+        .collect();
+        let mut contents = Zeroizing::new(String::new());
+        for (name, value) in &expected {
+            contents.push_str(&serialize_dotenv_entry(name, value));
+        }
+
+        let parsed = parse_dotenv(&contents).unwrap();
+        for (name, expected_value) in expected {
+            let (_, actual_value) = parsed
+                .iter()
+                .find(|(parsed_name, _)| parsed_name == name)
+                .unwrap();
+            assert_eq!(actual_value.as_str(), expected_value);
+        }
+    }
+
+    #[test]
+    fn dotenv_serializer_escapes_a_known_value() {
+        let value = "line\n\"quote\"\\tail";
+        let serialized = serialize_dotenv_entry("KNOWN", value);
+        assert_eq!(
+            serialized.as_str(),
+            "KNOWN=\"line\\n\\\"quote\\\"\\\\tail\"\n"
+        );
+        assert!(!serialized.contains(value));
+    }
+
+    #[test]
     fn package_manager_detection_recognizes_every_marker() {
         for (marker, expected) in [
             ("pnpm-lock.yaml", "pnpm"),
@@ -1252,6 +1446,16 @@ mod tests {
     fn shim_installed_programs_resolve_on_this_platform() {
         assert!(resolve_program("git").is_some(), "git should be on PATH");
         assert!(resolve_program("purser-definitely-not-a-real-program").is_none());
+    }
+
+    /// Removing a project whose directory is gone must not depend on separator style.
+    #[test]
+    #[cfg(windows)]
+    fn absolute_path_normalizes_separators_for_a_missing_directory() {
+        let forward = absolute_path(Path::new("C:/nope/./gone")).unwrap();
+        let backward = absolute_path(Path::new(r"C:\nope\gone")).unwrap();
+        assert_eq!(forward, backward);
+        assert_eq!(forward, PathBuf::from(r"C:\nope\gone"));
     }
 
     /// A project need not be a git repository; `project add` must still register it.
