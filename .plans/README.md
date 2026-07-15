@@ -7,11 +7,12 @@ Note: this is a public repo. Deeper strategy, archive, and vision docs stay in t
 private `futureos` repo (`docs/plans`, `docs/notes`).
 
 ## Start here
-1. **notes/next-steps.md** — current status + what to build next (Week 2: `purser up`)
-2. **purser_v4_plan.md** — full plan, scope, the three seams
-3. **notes/tech-stack.md** — language + crate choices
-4. **notes/purser-hook-ux.md** — transparent-aliases decision (`purser hook`)
+1. **notes/next-steps.md** — current status + what to do next (Weeks 1–3 built; Gate C′ is next)
+2. **purser_v4_plan.md** — v1 plan, scope, the three seams
+3. **purser_v1_1_plan.md** — proposed next: device mesh + `project move` (post-Gate C′)
+4. **notes/tech-stack.md** — language + crate choices
+5. **notes/purser-hook-ux.md** — transparent-aliases decision (`purser hook`)
 
 ## To resume with Claude
-Open a session and say: *"Read `.plans/next-steps.md` and this repo, then implement
-Week 2 (`purser up`) — delegate to Codex and review."*
+Open a session and point at `.plans/notes/next-steps.md`. It says where things stand and
+what to do next, grounded in the repo rather than in a fresh plan.
