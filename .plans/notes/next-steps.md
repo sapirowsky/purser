@@ -1,145 +1,192 @@
 ---
 title: "Next Steps — pick up here"
 status: "active"
-updated: "2026-07-15"
+updated: "2026-07-16"
 one_line: "Where Purser stands and exactly what to do next."
 ---
 
 # Next Steps — pick up here
 
-## Where it stands (end of 2026-07-15)
+## Where it stands (2026-07-16)
+
+**Week 3 is built. Sync works.** Set a secret or register a project on one device, sync,
+and it is on the other. That was the whole point of the project.
 
 - **Published:** `purser` 0.0.2 on crates.io (+ `purser-core`, `purser-vault`, `purser-store`).
   Repo: `github.com/sapirowsky/purser`, tagged `v0.0.2`. Code at `C:\Users\sapir\Desktop\purser`.
-- **Works today (single machine):** encrypted vault + agent-blind execution —
-  `import`, `secrets list/set`, `run`, `shell`, `agent`, `audit`. Values stay off disk,
-  out of the parent env, out of the audit log. Verified end-to-end.
-- **Week 2 built (branch `week2-manifest-up`, unmerged, unreleased):**
-  `project add/remove`, `status`, `up [--dry-run]`, plus `hook` and `--profile auto`.
-  Schema migration `002_project_paths` adds `projects.local_path`.
-  Verified by running: wiped a project folder → `up` cloned it, checked out its branch,
-  ran `npm install`. Hook proven in bash + PowerShell: dev tools see secrets, agents
-  don't, outside purser it passes through even with purser off PATH entirely.
-- **Not built yet:** device sync (Week 3), WSL keyring fallback + MCP metadata tools (Week 4).
-
-## ⚠ 2026-07-15 — the agent-blind half is CUT (Gate C, called early)
-
-The owner ran the whole thing end-to-end and called it:
-
-> "i dont see myself using this keyvault to hide values from agents especially that it
-> doesn't really hide it because agent is always one command away from showing it. i will
-> use it just with purser import when we have syncing so i don't have to remember about
-> setting up envs in all my devices"
-
-Correct, and the plan already conceded it — `run -- node -e "console.log(process.env.X)"`
-prints the value. Full reasoning: `purser_v4_plan.md` → "Gate C, called early".
+- **Branch `week2-manifest-up`** — unmerged, unreleased. The name is stale: it now carries all
+  of Week 3 as well. Rename or merge when convenient; nothing depends on the name.
 
 ```text
-DEAD  MCP metadata tools (Week 4). Further work on `agent --`. The "invisible to AI" claim.
-KEEP  The vault — it is the SYNC SUBSTRATE, not the agent feature. Values cannot replicate
-      between devices without encryption at rest. Cutting agent-blindness does not touch it.
-      Also keep: import / secrets / run / shell / hook / up / manifest / audit.
-NEW   `up --write-env` — opt-in, materializes a real .env from the vault on a fresh machine.
-      Deliberate relaxation of the no-plaintext rule; rails in the plan doc.
+Week 1  vault + agent-blind run          import, secrets, run, shell, agent, audit
+Week 2  manifest + up                    project add/remove, status, up, hook, --profile auto
+Week 3  device sync                      device pair, sync, projects-root      ← NEW
 ```
 
-**The remaining product is one sentence: bootstrap a machine + have my env already there.**
-Week 3 (sync) is now the only thing between here and done.
-
-## ▶ START HERE: Week 3 — device pairing + secret replication
-
-This is the half the owner actually wants. Everything else is built.
-
-**Scope decided 2026-07-15: SECRETS ONLY. The manifest is NOT synced.** Absolute local paths
-differ per machine, and solving that isn't needed for the stated want ("don't want to set up
-envs on every device"). Secrets carry no paths. The hard part — pairing, transport, vault-key
-exchange — is identical either way, so manifest sync is a cheap delta to add later behind the
-same seam-3 trait. Full reasoning: `purser_v4_plan.md` → "Sync scope, narrowed again".
-
-Suggested sequence (each step reviewable on its own; do NOT delegate all three at once):
+Week 3 commits, in order:
 
 ```text
-3a  Transport + device identity.  iroh connection between two processes behind the existing
-    `Transport` trait. Prove two machines can talk. No secrets move yet.
-3b  Pairing + vault-key transfer.  One-time code -> authenticated handshake (PAKE/Noise
-    seeded by the code) -> vault key sent ONLY over that authenticated channel.
-    THE RISKIEST STEP: a bug here leaks the vault key. Review this one hardest.
-    An unpaired device must get nothing. Test that explicitly.
-3c  Replication.  Last-writer-wins per secret version, full history retained (a bad edit
-    must stay recoverable). `sync_state` cursor per peer.
+38e5400  3a+3b  iroh transport, device identity, pairing + vault-key transfer
+c47af28  3c     secret replication between paired devices
+414b8ab         order sync conflicts by instant, not timestamp string
+8d6681a  3d     project manifest replication + projects root
 ```
 
-**Gate:** set a secret on macOS, run purser on Windows, the value is there.
+Schema is at **migration 003** (`003_manifest_sync`: `projects.updated_at` + `settings`).
+It has been applied to the real Windows database; existing data survived intact.
 
-### Two design decisions to make before 3c
+## What Week 3 actually does
 
 ```text
-1. RECORD SHAPE. `purser-sync::Record` is (id, version, ciphertext) and must NOT learn the
-   word "secret" (seam 3). But a receiver needs name + profile to reconstruct the row.
-   → Preferred: ciphertext = encrypt({name, profile, group, value}), i.e. encrypt the WHOLE
-     payload, not just the value. Sync stays blind, and secret NAMES never travel in
-     plaintext either — which matters the moment a relay exists (that relay is the
-     monetization seam; it must learn nothing).
-   → Note this differs from today's on-disk format, where secret_versions.ciphertext
-     encrypts only the value. Decide whether sync re-encrypts a payload or the at-rest
-     format changes.
-
-2. TRAIT SHAPE. The current `Transport` trait is sync and infallible
-   (`fn send(&self, ...)` / `fn recv(&self) -> Vec<Record>`). iroh is async and fallible.
-   It will need to become async + `Result`. That is expected — it is a stub, not a contract.
+purser device pair                 # on A: prints a one-time code, 10 min, single use
+purser device pair <CODE>          # on B: enrolls, receives the vault key
+purser sync serve                  # on A: listen for paired peers
+purser sync --peer <NODE_ID>       # on B: bidirectional exchange (secrets + manifest)
+purser projects-root <PATH>        # per-device; where `up` clones projects it has never seen
+purser device info | list          # this device's NodeId; known devices
+purser device listen | connect     # 3a connectivity probe (unauthenticated, harmless)
 ```
 
-## Notes from the Week 2 build (worth knowing)
+Three separate ALPNs, deliberately: `purser/transport/1` (hello), `purser/pair/1`,
+`purser/sync/1`. Only paired devices may sync — the server checks the peer's NodeId against
+the `devices` table and refuses before building or sending any record.
 
-- **Windows `.cmd` shims.** `Command::new("npm")` cannot spawn on Windows: `CreateProcess`
-  only appends `.exe`, and npm/pnpm/yarn are `.cmd` shims. Programs now resolve through
-  PATH/PATHEXT. Anything new that spawns a tool must use `child_command`/`program_command`,
-  not `Command::new` on a bare name.
-- **`\\?\` verbatim paths.** `fs::canonicalize` always adds the prefix on Windows; it does
-  not compare equal to `current_dir` output and git rejects it. `canonical_project_path`
-  strips it. Sync (Week 3) will need its own answer for cross-machine path portability —
-  the manifest stores absolute local paths, which differ per machine by design (seam 1:
-  the ULID is identity, the path is only a projection).
-- **`_in-project` costs ~32ms**, of which only ~5ms is SQLite — the rest is Windows process
-  spawn, so there's little left to optimize without a resident daemon.
+## ⚠ The one thing that matters now: Gate C′
 
-## Then (later weeks, don't start until Gate B actually passes)
+**Everything above has only ever run on ONE machine.** Every "second device" in testing was a
+`PURSER_DEVICE` scope on this Windows box. That is real enough to prove the protocol, and it
+is NOT the same as the Mac.
 
-- **Week 3:** device pairing + p2p replication (iroh) between two machines. Set a secret
-  on macOS, `purser up` on Windows, it's there.
-- **Week 4:** add WSL (keyring file fallback), cross-platform hardening, the MCP metadata
-  tools for `agent` (`secret_exists`/`secret_list`/`secret_usage`).
+What the Mac introduces that has never been exercised:
 
-## Known TODOs already in the code
+```text
+- NAT traversal between two real networks (all testing was one host, one relay hop).
+- macOS Keychain instead of Windows Credential Manager (the `keyring` crate's other backend).
+- A genuinely different filesystem layout — the whole reason local_path is not synced.
+- Two clocks that can disagree (LWW trusts wall clocks; see limitations).
+```
 
-- `purser-vault`: WSL/Linux-without-Secret-Service keyring fallback (encrypted key file).
-- `purser-sync`: real iroh transport + pairing + last-writer-wins reconciliation (all stubs).
-- `agent` command: currently sanitized launcher + audit only; MCP tools are Week 4.
+**Expect the first real bug in pairing across networks, not in the merge logic above.**
+
+Gate C′ (from the plan): run all 3 systems off Purser for a week. Pass = you stop manually
+cloning repos and re-adding env when switching machines. Fail = sync is fiddlier than the
+manual dance, and the honest answer is that Purser is a local vault plus `up`.
+
+## ▶ START HERE tomorrow
+
+```text
+1. Pair the Mac. Build on macOS, `purser device pair` on Windows, enter the code on the Mac.
+   THIS IS THE REAL TEST. If it works, everything else follows.
+2. Set projects-root on the Mac, `purser sync --peer <windows-node-id>`, then `purser up`.
+   The Mac should clone your projects into its own root at its own paths.
+3. Then just use it for a week. That is Gate C′; there is nothing to build to pass it.
+```
+
+Consider first, before pairing the Mac for real (small, and it touches the riskiest path):
+
+```text
+- Pairing code is a CLI ARGUMENT, so it lands in shell history and is briefly visible in the
+  process list. It is single-use and expires in 10 minutes, but it is the thing that grants
+  the vault key. Reading it from stdin instead is a small change. Decide before, not after.
+```
+
+## Known limitations — real, not theoretical
+
+```text
+- LWW TRUSTS WALL CLOCKS. Two devices whose clocks disagree by more than the gap between two
+  edits of the same secret can pick the wrong winner. Version history is what makes this
+  recoverable — nothing is destroyed. The plan accepted this tradeoff knowingly.
+- Timestamps are ordered by parsed instant (414b8ab), NOT by string. The database holds two
+  formats because an early build wrote raw epoch seconds. Never compare created_at with `>`.
+- The debug binary went 4.8M -> 33M when iroh was linked. Fine, but this is a "one binary per
+  machine" tool, so know the cost. Release size unmeasured.
+- iroh uses the n0 PUBLIC relay (`presets::N0`) for NAT setup. It only forwards ciphertext and
+  cannot read anything, but it is third-party infrastructure. Self-hosting is a later choice.
+- `device listen`/`connect` (3a) is UNAUTHENTICATED by design. It carries only a hello and
+  says so loudly. Never let it carry anything else.
+- Pairing REFUSES onto a device that already holds secrets — replacing its vault key would
+  make them permanently unreadable. So pair a device BEFORE importing anything on it.
+```
+
+## Testing two devices on one machine
+
+`PURSER_DEVICE=<name>` scopes **both** the keyring accounts and the SQLite database, so a
+second identity can be exercised without a second box. Unset = the real device.
+
+```text
+DB:      %LOCALAPPDATA%\purser\devices\<name>\purser.db
+Keyring: device-key:<name>.purser  /  vault-key:<name>.purser
+```
+
+Without it, every process here is the same device and pairing fails with iroh's
+"Connecting to ourself is not supported". Cleanup after testing:
+
+```text
+rm -rf %LOCALAPPDATA%\purser\devices\<name>
+cmdkey /delete:device-key:<name>.purser
+cmdkey /delete:vault-key:<name>.purser
+```
+
+**NEVER delete the unscoped `vault-key.purser`** — that key decrypts every secret you own.
+
+## Dead — do not build (Gate C, called 2026-07-15)
+
+```text
+- MCP metadata tools (secret_exists / secret_list / secret_usage). Cut. Not "later" — dead.
+- Further work on `purser agent --`. It stays because it works and costs nothing to keep.
+- The "invisible to AI agents" claim, anywhere.
+```
+
+## Remaining, in rough priority
+
+```text
+- Gate C′: three systems, one week. Nothing to build. ← the only thing that matters
+- WSL keyring fallback (encrypted key file). WSL often has no Secret Service. Week 4's
+  remaining real work, and the third of the owner's three systems.
+- Pairing code via stdin rather than argv (see above).
+- `sync_state` cursors. The table exists and is UNUSED — full exchange is correct at this
+  size. Do not build this until the data is big enough to justify it.
+- Rename the branch, or merge Weeks 2+3 to main and release.
+```
+
+## Known TODOs in the code
+
+```text
+- purser-vault: WSL/Linux-without-Secret-Service keyring fallback (encrypted key file).
 - `up` reports a profile's *configured* secrets, but nothing declares which secrets a project
-  actually NEEDS — so "missing" can only ever mean "registered but unconfigured". A
-  `required secrets` list per project would make `up`'s env check meaningful.
+  actually NEEDS — so "missing" can only mean "registered but unconfigured". A per-project
+  `required secrets` list would make `up`'s env check meaningful.
 - The hook wraps a fixed tool list (npm/pnpm/bun/yarn/node/vite/cargo/uv, claude/codex).
-  Adding a tool means re-running `purser hook`; there is no per-project override yet.
-- Only bash/zsh/powershell are generated — no fish, no nushell, no cmd.
+  Adding a tool means re-running `purser hook`; no per-project override.
+- Only bash/zsh/powershell hooks — no fish, nushell, cmd.
+- `purser-sync` no longer has sync stubs; pairing and replication are real. The `Transport`
+  trait is now async + Result and is RPITIT, so it is not dyn-compatible. Fine for now; a
+  blob/relay backend swaps in via generics.
+```
 
-## Small loose ends (optional, low effort)
+## Small loose ends (optional)
 
-- [ ] Buy a domain when ready — `purser.rs` (via Gandi/101domain) or `purser.sh` (Porkbun).
-      Least urgent. `purser-rs.github.io` is the free stopgap. (see naming.md)
-- [ ] Claim remaining crate names if wanted: publish `purser-sync/mcp/daemon` stubs at 0.0.2.
-- [ ] Umbrella GitHub org: still deferred; `purser` stays on personal profile. (see naming.md)
-- [ ] This `futureos` planning repo is local-only (unpushed) — push it somewhere if desired.
-- [ ] Record the two design futures discussed today as named capabilities in the plan:
-      loose-file (non-git) sync via "synced path sets", and the hosted/self-hosted central
-      state server via the seam-3 transport trait. (Architecture already supports both.)
+```text
+- [ ] Buy a domain — `purser.rs` (Gandi/101domain) or `purser.sh` (Porkbun). `purser-rs.github.io`
+      is the free stopgap. (see naming.md)
+- [ ] Claim remaining crate names: publish `purser-sync/mcp/daemon` stubs at 0.0.2.
+- [ ] Umbrella GitHub org: deferred; `purser` stays on the personal profile. (see naming.md)
+- [ ] Record the two design futures as named capabilities in the plan: loose-file (non-git)
+      sync via "synced path sets", and a hosted/self-hosted state server behind seam 3.
+```
 
 ## How to resume with Claude
 
-Just say e.g. "implement Week 3 (device pairing), delegate to Codex and review" — or point at
-this file. Everything above is grounded in the current repo state, not a fresh plan.
+Point at this file. Everything above is grounded in the repo as it stands, not a fresh plan.
 
-One lesson from the Week 2 delegation, worth repeating: Codex's output passed its own
-`build`/`test`/`clippy`/`fmt` clean and was still broken on Windows — `up` could not install
-deps for any Node project. Its tests checked package-manager *detection* but never
-*execution*. **Green checks are not verification; run the thing.** Every real bug that
-session was found by executing the command, not by reading the diff or trusting the report.
+Two lessons worth repeating, both earned:
+
+**Green checks are not verification; run the thing.** Every real bug in Week 3 was found by
+executing the command, never by reading the diff or trusting a report. The 3b transport race
+(a listener died serving a peer that hung up normally) passed every test and only appeared
+when two processes actually talked. Codex could not compile in 3a/3b and could not run the
+CLI in 3c/3d — it was honest about it, but it means the CLI verification is always yours.
+
+**A passing negative test can pass for the wrong reason.** The first "unpaired peer is
+refused" test passed because the rogue refused *itself* client-side and never dialed. The
+server's authorization never ran. If a refusal test passes, check the *server* logged it.
