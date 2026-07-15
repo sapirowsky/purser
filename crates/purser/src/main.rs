@@ -197,8 +197,12 @@ enum SyncCommand {
 
 #[derive(Debug, Args)]
 struct UpArgs {
+    /// Report what would change without syncing, cloning, or installing.
     #[arg(long)]
     dry_run: bool,
+    /// Use only what this device already knows; do not contact paired devices first.
+    #[arg(long)]
+    no_sync: bool,
     /// WARNING: materialize vault secrets into missing project .env files.
     #[arg(long)]
     write_env: bool,
@@ -291,7 +295,17 @@ async fn sync_async(args: SyncArgs) -> Result<i32> {
         (Some(SyncCommand::Serve), Some(_)) => {
             bail!("--peer cannot be used with `sync serve`");
         }
-        (None, None) => bail!("either `sync serve` or `sync --peer <NODE_ID>` is required"),
+        // Pairing already recorded who the peers are; making the owner paste a NodeId to
+        // reach a device Purser knows about is friction Purser invented.
+        (None, None) => {
+            let (reached, unreachable) = sync_all_paired(identity.key).await?;
+            if reached == 0 {
+                bail!("no paired device could be reached");
+            }
+            if unreachable > 0 {
+                println!("Synced with {reached}; {unreachable} unreachable.");
+            }
+        }
     }
     Ok(0)
 }
@@ -360,6 +374,10 @@ async fn serve_sync_connection(connection: SyncConnection) -> Result<()> {
     Ok(())
 }
 
+/// A peer that is asleep must cost seconds, not minutes: `up` dials every paired device
+/// before doing any local work, and one unreachable laptop cannot be allowed to hang it.
+const SYNC_DIAL_TIMEOUT: Duration = Duration::from_secs(30);
+
 async fn sync_peer(key: iroh::SecretKey, node_id: &str) -> Result<()> {
     let peer: iroh::PublicKey = node_id
         .parse()
@@ -370,18 +388,67 @@ async fn sync_peer(key: iroh::SecretKey, node_id: &str) -> Result<()> {
     if !paired {
         bail!("sync refused: {peer} is not a paired device");
     }
+    let endpoint = bind_sync(key).await?;
+    let result = sync_one_peer(&endpoint, peer).await;
+    endpoint.close().await;
+    result
+}
+
+/// Exchange with every paired device, reusing one endpoint.
+///
+/// Returns (reached, unreachable). A device that is off is an ordinary fact of syncing
+/// between your own machines, not an error: the others still sync, and this one will catch
+/// up next time. Only the caller decides whether nothing-reached is worth failing over.
+async fn sync_all_paired(key: iroh::SecretKey) -> Result<(usize, usize)> {
+    let peers: Vec<(iroh::PublicKey, String)> = Store::open()?
+        .list_devices()?
+        .into_iter()
+        .filter(|device| !device.is_self)
+        .map(|device| {
+            let key = iroh::PublicKey::try_from(device.public_key.as_slice())
+                .context("a stored device has an invalid iroh public key")?;
+            Ok((key, device.label))
+        })
+        .collect::<Result<_>>()?;
+    if peers.is_empty() {
+        bail!("no paired devices yet. Enroll one with `purser device pair`.");
+    }
+
+    let endpoint = bind_sync(key).await?;
+    let (mut reached, mut unreachable) = (0, 0);
+    for (peer, label) in peers {
+        println!("{label} ({}):", short_node_id(&peer));
+        match tokio::time::timeout(SYNC_DIAL_TIMEOUT, sync_one_peer(&endpoint, peer)).await {
+            Ok(Ok(())) => reached += 1,
+            Ok(Err(error)) => {
+                unreachable += 1;
+                eprintln!("  warning: sync failed: {error:#}");
+            }
+            Err(_) => {
+                unreachable += 1;
+                eprintln!("  warning: no response within {SYNC_DIAL_TIMEOUT:?}; is it awake and running `purser sync serve`?");
+            }
+        }
+    }
+    endpoint.close().await;
+    Ok((reached, unreachable))
+}
+
+async fn sync_one_peer(endpoint: &iroh::Endpoint, peer: iroh::PublicKey) -> Result<()> {
     let store = Store::open()?;
     let mut records = secret_sync::build_records(&store)?;
     let secret_sent = records.len();
     let project_records = project_sync::build_records(&store)?;
     let project_sent = project_records.len();
     records.extend(project_records);
-    let endpoint = bind_sync(key).await?;
-    let connection = connect_sync(&endpoint, peer).await?;
+    let connection = connect_sync(endpoint, peer).await?;
     let incoming = connection.exchange_initiator(&records).await?;
-    apply_and_report_sync_records(&Store::open()?, &incoming, secret_sent, project_sent)?;
-    endpoint.close().await;
-    Ok(())
+    apply_and_report_sync_records(&Store::open()?, &incoming, secret_sent, project_sent)
+}
+
+/// Enough of a NodeId to recognize, not so much that it wraps the line.
+fn short_node_id(peer: &iroh::PublicKey) -> String {
+    peer.to_string().chars().take(12).collect()
 }
 
 fn report_sync_summary(summary: &secret_sync::SyncSummary) {
@@ -800,7 +867,35 @@ fn status() -> Result<i32> {
     Ok(0)
 }
 
+/// Pull from the other devices before reproducing this one, so `up` on a fresh machine is
+/// one command rather than three.
+///
+/// Nothing here is fatal. `up` must keep working on a plane: with no peers paired, or none
+/// of them awake, the local manifest is still worth acting on. Only the networking runtime
+/// is paid for, and only when a sync is actually attempted.
+fn sync_before_up() -> Result<()> {
+    let identity = ensure_device_identity(None)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("could not start the sync networking runtime")?;
+    match runtime.block_on(sync_all_paired(identity.key)) {
+        Ok((reached, unreachable)) => {
+            println!("Synced with {reached} device(s); {unreachable} unreachable.");
+        }
+        Err(error) => {
+            eprintln!("warning: skipping sync: {error:#}");
+            eprintln!("warning: continuing with this device's own manifest.");
+        }
+    }
+    println!();
+    Ok(())
+}
+
 fn up(args: UpArgs) -> Result<i32> {
+    if !args.no_sync && !args.dry_run {
+        sync_before_up()?;
+    }
     let store = Store::open()?;
     let projects = store.list_projects()?;
     if projects.is_empty() {
