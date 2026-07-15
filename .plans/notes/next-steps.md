@@ -46,26 +46,48 @@ NEW   `up --write-env` — opt-in, materializes a real .env from the vault on a 
 **The remaining product is one sentence: bootstrap a machine + have my env already there.**
 Week 3 (sync) is now the only thing between here and done.
 
-## ▶ START HERE: Week 3 — device pairing + p2p replication
+## ▶ START HERE: Week 3 — device pairing + secret replication
 
 This is the half the owner actually wants. Everything else is built.
 
-1. `purser device pair` — one-time code, authenticated handshake (PAKE/Noise over iroh),
-   transfer the vault key over the authenticated channel only.
-2. `purser device list` — trusted devices.
-3. Replication — manifest + secret ciphertext, last-writer-wins per secret version, keep
-   full version history (a bad edit must stay recoverable).
-4. **Gate:** set a secret on one machine, `purser up` on another, it's there.
+**Scope decided 2026-07-15: SECRETS ONLY. The manifest is NOT synced.** Absolute local paths
+differ per machine, and solving that isn't needed for the stated want ("don't want to set up
+envs on every device"). Secrets carry no paths. The hard part — pairing, transport, vault-key
+exchange — is identical either way, so manifest sync is a cheap delta to add later behind the
+same seam-3 trait. Full reasoning: `purser_v4_plan.md` → "Sync scope, narrowed again".
 
-Keep seam 3 honest: `purser-sync` moves opaque `(id, ciphertext, version)` records and must
-NOT know the word "secret". Transport stays behind a trait so a relay/blob backend can be
-added later without touching callers.
+Suggested sequence (each step reviewable on its own; do NOT delegate all three at once):
 
-**Known problem to solve in Week 3:** the manifest stores ABSOLUTE local paths, which differ
-per machine by design. Syncing `projects` rows verbatim would put Windows paths on macOS.
-The ULID is identity (seam 1) and the path is a projection — so sync the identity + remote,
-and let each device resolve its own local path. Decide where the projects root lives per
-device (a configured base dir?) before replicating the manifest.
+```text
+3a  Transport + device identity.  iroh connection between two processes behind the existing
+    `Transport` trait. Prove two machines can talk. No secrets move yet.
+3b  Pairing + vault-key transfer.  One-time code -> authenticated handshake (PAKE/Noise
+    seeded by the code) -> vault key sent ONLY over that authenticated channel.
+    THE RISKIEST STEP: a bug here leaks the vault key. Review this one hardest.
+    An unpaired device must get nothing. Test that explicitly.
+3c  Replication.  Last-writer-wins per secret version, full history retained (a bad edit
+    must stay recoverable). `sync_state` cursor per peer.
+```
+
+**Gate:** set a secret on macOS, run purser on Windows, the value is there.
+
+### Two design decisions to make before 3c
+
+```text
+1. RECORD SHAPE. `purser-sync::Record` is (id, version, ciphertext) and must NOT learn the
+   word "secret" (seam 3). But a receiver needs name + profile to reconstruct the row.
+   → Preferred: ciphertext = encrypt({name, profile, group, value}), i.e. encrypt the WHOLE
+     payload, not just the value. Sync stays blind, and secret NAMES never travel in
+     plaintext either — which matters the moment a relay exists (that relay is the
+     monetization seam; it must learn nothing).
+   → Note this differs from today's on-disk format, where secret_versions.ciphertext
+     encrypts only the value. Decide whether sync re-encrypts a payload or the at-rest
+     format changes.
+
+2. TRAIT SHAPE. The current `Transport` trait is sync and infallible
+   (`fn send(&self, ...)` / `fn recv(&self) -> Vec<Record>`). iroh is async and fallible.
+   It will need to become async + `Result`. That is expected — it is a stub, not a contract.
+```
 
 ## Notes from the Week 2 build (worth knowing)
 

@@ -292,6 +292,32 @@ CONSEQUENCE — the remaining product is one sentence:
   Week 3 is now the ONLY thing between here and done.
 ```
 
+### Sync scope, narrowed again (2026-07-15)
+
+Week 3 replicates **secrets only**. The project manifest stays device-local and is NOT synced.
+
+```text
+WHY: `projects.local_path` is an absolute path — `C:\Users\sapir\Desktop\purser` on Windows,
+     `/Users/sapir/Desktop/purser` on macOS. Replicating those rows verbatim would push one
+     machine's paths onto another. Solving that needs either a per-device projects root
+     (forces a flat layout) or a device-local path table with git-remote binding (+1 table,
+     +reconciliation, migration 003).
+
+     None of that is needed for the owner's stated want: "so I don't have to remember about
+     setting up envs in all my devices." Secrets carry NO paths, so replicating them alone
+     dissolves the whole problem.
+
+     Crucially, the hard part of Week 3 — pairing, iroh transport, vault-key exchange — is
+     IDENTICAL either way. Manifest sync is a small delta to add later, behind the same
+     seam-3 transport, once the transport is proven. Nothing is wasted by deferring it.
+
+COST, accepted: on a new machine you still clone repos and `project add` them by hand, once
+     per device. `up --write-env` then materializes the env. The clone-every-repo half of the
+     original pain stays manual for now — revisit only if it actually bites.
+
+SCHEMA: no change. `projects` simply never enters the synced set.
+```
+
 ### The plaintext rule, deliberately relaxed
 
 This plan guaranteed *"no plaintext .env is ever written."* That guarantee existed to keep
