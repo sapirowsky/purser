@@ -161,11 +161,24 @@ where
             }
 
             summary.conflicted += 1;
+            let Some(order) =
+                compare_write_times(&payload.created_at, &existing_version.created_at)
+            else {
+                // Neither value is destroyed: the local one stays, the incoming one is
+                // still in the sender's history, and the owner is told to pick.
+                summary.skipped += 1;
+                summary.warnings.push(format!(
+                    "CONFLICT: concurrent edits to secret {} version {}, but their write times \
+                     cannot be ordered; kept the local value — resolve this one by hand",
+                    payload.name, payload.version
+                ));
+                continue;
+            };
             summary.warnings.push(format!(
                 "CONFLICT: concurrent edits to secret {} version {}; last writer wins",
                 payload.name, payload.version
             ));
-            if payload.created_at > existing_version.created_at {
+            if order.is_gt() {
                 let ciphertext = encrypt_at_rest(&payload.value[..])
                     .context("could not encrypt a received value for local storage")?;
                 store.replace_synced_secret_version(
@@ -202,6 +215,20 @@ where
         summary.received += 1;
     }
     Ok(summary)
+}
+
+/// Order two `created_at` values by the instant they were written, or `None` if either is
+/// unrecognized. Never compare these as strings: the database holds more than one
+/// timestamp format, and string order contradicts real time across them.
+///
+/// This orders by each writer's own wall clock, so it is only as good as the clocks
+/// agreeing. Two devices whose clocks differ by more than the gap between two edits can
+/// pick the wrong winner. The losing value is never destroyed — it stays in the sender's
+/// version history — but that is a real limitation, not a theoretical one.
+fn compare_write_times(incoming: &str, local: &str) -> Option<std::cmp::Ordering> {
+    let incoming = purser_store::unix_nanos_from_timestamp(incoming)?;
+    let local = purser_store::unix_nanos_from_timestamp(local)?;
+    Some(incoming.cmp(&local))
 }
 
 fn encode_payload(
@@ -429,6 +456,89 @@ mod tests {
             b"remote-wins"[..]
         );
         assert!(summary.warnings[0].contains("last writer wins"));
+    }
+
+    #[test]
+    fn lww_across_the_two_stored_timestamp_formats_follows_real_time() {
+        // A stale incoming value whose timestamp string sorts ABOVE the newer local one.
+        // Comparing these as strings hands the conflict to the stale value; comparing the
+        // instants they name keeps the current one.
+        let stale_epoch_form = "999999999.000000000Z"; // 2001-09-09
+        let current_civil_form = "2026-07-14T19:27:16.358278100Z";
+        assert!(
+            stale_epoch_form > current_civil_form,
+            "string order would pick the stale value"
+        );
+
+        let sender = Store::open_in_memory().unwrap();
+        let receiver = Store::open_in_memory().unwrap();
+        insert_version(
+            &sender,
+            "01SHARED",
+            "TOKEN",
+            "test",
+            1,
+            b"stale-must-lose",
+            stale_epoch_form,
+        );
+        insert_version(
+            &receiver,
+            "01SHARED",
+            "TOKEN",
+            "test",
+            1,
+            b"current-must-win",
+            current_civil_form,
+        );
+
+        let records = build_records_with(&sender, open, seal).unwrap();
+        let summary = apply_records_with(&receiver, &records, open, seal).unwrap();
+        assert_eq!(
+            (summary.received, summary.skipped, summary.conflicted),
+            (0, 1, 1)
+        );
+        let versions = receiver.all_secret_versions_for_sync().unwrap();
+        assert_eq!(
+            open(&versions[0].ciphertext).unwrap()[..],
+            b"current-must-win"[..]
+        );
+    }
+
+    #[test]
+    fn an_unorderable_conflict_keeps_the_local_value_instead_of_guessing() {
+        let sender = Store::open_in_memory().unwrap();
+        let receiver = Store::open_in_memory().unwrap();
+        insert_version(
+            &sender,
+            "01SHARED",
+            "TOKEN",
+            "test",
+            1,
+            b"incoming",
+            "garbage",
+        );
+        insert_version(
+            &receiver,
+            "01SHARED",
+            "TOKEN",
+            "test",
+            1,
+            b"local-kept",
+            "2026-07-14T19:27:16.358278100Z",
+        );
+
+        let records = build_records_with(&sender, open, seal).unwrap();
+        let summary = apply_records_with(&receiver, &records, open, seal).unwrap();
+        assert_eq!(
+            (summary.received, summary.skipped, summary.conflicted),
+            (0, 1, 1)
+        );
+        let versions = receiver.all_secret_versions_for_sync().unwrap();
+        assert_eq!(
+            open(&versions[0].ciphertext).unwrap()[..],
+            b"local-kept"[..]
+        );
+        assert!(summary.warnings[0].contains("cannot be ordered"));
     }
 
     #[test]

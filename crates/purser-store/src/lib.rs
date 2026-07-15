@@ -710,6 +710,68 @@ fn timestamp() -> String {
     )
 }
 
+/// Nanoseconds since the Unix epoch for a `created_at` written by [`timestamp`].
+///
+/// Ordering timestamps by string comparison would be wrong: this database already holds
+/// two formats, because an earlier build wrote raw epoch seconds (`1784057032.061923000Z`)
+/// before the current civil-date form (`2026-07-15T09:44:28.637998600Z`) replaced it.
+/// Lexically every legacy row sorts before every modern one regardless of when it was
+/// actually written. Both forms are parsed here so callers can order them by real time,
+/// and so a future format change cannot silently corrupt an ordering again.
+///
+/// Returns `None` for anything unrecognized; callers must treat that as "cannot order"
+/// rather than as "older".
+pub fn unix_nanos_from_timestamp(timestamp: &str) -> Option<i128> {
+    let body = timestamp.strip_suffix('Z')?;
+    let (head, nanos) = body.split_once('.')?;
+    if nanos.len() != 9 || !nanos.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let nanos: i128 = nanos.parse().ok()?;
+
+    let seconds = match head.split_once('T') {
+        Some((date, time)) => {
+            let (year, month, day) = parse_triplet(date, '-')?;
+            let (hour, minute, second) = parse_triplet(time, ':')?;
+            if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+                return None;
+            }
+            if hour > 23 || minute > 59 || second > 59 {
+                return None;
+            }
+            unix_days_from_civil(year, month, day) as i128 * 86_400
+                + hour as i128 * 3_600
+                + minute as i128 * 60
+                + second as i128
+        }
+        // The legacy form: whole seconds since the epoch, no civil date.
+        None => head.parse::<i64>().ok()? as i128,
+    };
+    Some(seconds * 1_000_000_000 + nanos)
+}
+
+fn parse_triplet(text: &str, separator: char) -> Option<(i64, i64, i64)> {
+    let mut parts = text.split(separator);
+    let first = parts.next()?.parse().ok()?;
+    let second = parts.next()?.parse().ok()?;
+    let third = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((first, second, third))
+}
+
+/// Inverse of [`civil_date_from_unix_days`] (Howard Hinnant's `days_from_civil`).
+fn unix_days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month_prime = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
 fn civil_date_from_unix_days(days: i64) -> (i64, i64, i64) {
     let shifted = days + 719_468;
     let era = if shifted >= 0 {
@@ -757,6 +819,79 @@ mod tests {
         assert!(MIGRATION_002_PROJECT_PATHS.contains("ALTER TABLE"));
         assert_eq!(migrations().len(), 2);
         assert_eq!(civil_date_from_unix_days(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn civil_days_round_trip_against_their_inverse() {
+        for days in [-25_567_i64, -1, 0, 1, 19_000, 20_284, 100_000] {
+            let (year, month, day) = civil_date_from_unix_days(days);
+            assert_eq!(unix_days_from_civil(year, month, day), days, "{days}");
+        }
+        // Leap day, the classic off-by-one in this algorithm.
+        assert_eq!(
+            civil_date_from_unix_days(unix_days_from_civil(2024, 2, 29)),
+            (2024, 2, 29)
+        );
+    }
+
+    #[test]
+    fn timestamps_parse_back_to_the_instant_they_were_written_from() {
+        let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let parsed = unix_nanos_from_timestamp(&timestamp()).expect("own format must parse");
+        let after = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        assert!(parsed >= before.as_nanos() as i128 && parsed <= after.as_nanos() as i128);
+    }
+
+    #[test]
+    fn both_stored_timestamp_formats_parse_to_the_same_instant() {
+        // These two forms are both present in a real Purser database, because an early
+        // build wrote raw epoch seconds before the civil-date form replaced it.
+        // 1784057032 IS 2026-07-14T19:23:52Z, and only parsing can tell you that.
+        assert_eq!(
+            unix_nanos_from_timestamp("1784057032.061923000Z"),
+            unix_nanos_from_timestamp("2026-07-14T19:23:52.061923000Z")
+        );
+        assert_eq!(
+            unix_nanos_from_timestamp("1970-01-01T00:00:00.000000000Z"),
+            Some(0)
+        );
+        assert_eq!(unix_nanos_from_timestamp("0.000000000Z"), Some(0));
+    }
+
+    #[test]
+    fn string_order_disagrees_with_real_time_across_the_two_formats() {
+        // Every legacy row this project actually holds predates the format change, and an
+        // epoch from this era starts with '1' while a civil date starts with '2' — so for
+        // real data, string order happens to agree with real time. It is coincidence, not
+        // a property: an epoch outside 2001-09-09..2033-05-18 breaks it, and so would the
+        // next format change. Order by instant so correctness never rests on the luck.
+        let older_epoch = "999999999.000000000Z"; // 2001-09-09
+        let newer_civil = "2026-07-14T19:27:16.358278100Z";
+
+        assert!(
+            older_epoch > newer_civil,
+            "string order puts the older row last"
+        );
+        assert!(
+            unix_nanos_from_timestamp(older_epoch) < unix_nanos_from_timestamp(newer_civil),
+            "real time puts it first"
+        );
+    }
+
+    #[test]
+    fn unorderable_timestamps_are_rejected_rather_than_guessed() {
+        for bad in [
+            "",
+            "Z",
+            "not-a-time",
+            "2026-07-14T19:27:16Z",           // no nanoseconds
+            "2026-07-14T19:27:16.1234Z",      // wrong nanosecond width
+            "2026-13-01T00:00:00.000000000Z", // month out of range
+            "2026-07-14T25:00:00.000000000Z", // hour out of range
+            "2026-07-14T19:27:16.358278100",  // no trailing Z
+        ] {
+            assert_eq!(unix_nanos_from_timestamp(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
