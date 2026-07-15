@@ -8,11 +8,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MIGRATION_001_INIT: &str = include_str!("../migrations/001_init.sql");
 pub const MIGRATION_002_PROJECT_PATHS: &str = include_str!("../migrations/002_project_paths.sql");
+pub const MIGRATION_003_MANIFEST_SYNC: &str = include_str!("../migrations/003_manifest_sync.sql");
 
 pub fn migrations() -> &'static [(&'static str, &'static str)] {
     &[
         ("001_init", MIGRATION_001_INIT),
         ("002_project_paths", MIGRATION_002_PROJECT_PATHS),
+        ("003_manifest_sync", MIGRATION_003_MANIFEST_SYNC),
     ]
 }
 
@@ -84,6 +86,18 @@ pub struct Project {
     pub package_manager: Option<String>,
     pub profile_ref: Option<String>,
     pub local_path: Option<String>,
+    pub updated_at: String,
+}
+
+/// The portable portion of a project manifest. A local path cannot be represented here.
+pub struct SyncProject<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub git_remote: Option<&'a str>,
+    pub branch: Option<&'a str>,
+    pub package_manager: Option<&'a str>,
+    pub profile_ref: Option<&'a str>,
+    pub updated_at: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -409,9 +423,17 @@ impl Store {
             self.connection.execute(
                 "UPDATE projects
                  SET name = ?1, git_remote = ?2, branch = ?3, package_manager = ?4,
-                     profile_ref = ?5
-                 WHERE id = ?6",
-                params![name, git_remote, branch, package_manager, profile_ref, id],
+                     profile_ref = ?5, updated_at = ?6
+                 WHERE id = ?7",
+                params![
+                    name,
+                    git_remote,
+                    branch,
+                    package_manager,
+                    profile_ref,
+                    timestamp(),
+                    id
+                ],
             )?;
             Ok(id)
         } else {
@@ -419,8 +441,8 @@ impl Store {
             self.connection.execute(
                 "INSERT INTO projects(
                      id, name, git_remote, branch, package_manager, profile_ref, local_path,
-                     created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
                 params![
                     id,
                     name,
@@ -438,7 +460,8 @@ impl Store {
 
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, name, git_remote, branch, package_manager, profile_ref, local_path
+            "SELECT id, name, git_remote, branch, package_manager, profile_ref, local_path,
+                    updated_at
              FROM projects ORDER BY rowid",
         )?;
         let rows = statement.query_map([], project_from_row)?;
@@ -460,12 +483,107 @@ impl Store {
         Ok(self
             .connection
             .query_row(
-                "SELECT id, name, git_remote, branch, package_manager, profile_ref, local_path
+                "SELECT id, name, git_remote, branch, package_manager, profile_ref, local_path,
+                        updated_at
                  FROM projects WHERE local_path = ?1",
                 [path],
                 project_from_row,
             )
             .optional()?)
+    }
+
+    pub fn find_project_by_id(&self, id: &str) -> Result<Option<Project>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT id, name, git_remote, branch, package_manager, profile_ref, local_path,
+                        updated_at
+                 FROM projects WHERE id = ?1",
+                [id],
+                project_from_row,
+            )
+            .optional()?)
+    }
+
+    pub fn find_project_by_name(&self, name: &str) -> Result<Option<Project>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT id, name, git_remote, branch, package_manager, profile_ref, local_path,
+                        updated_at
+                 FROM projects WHERE name = ?1 ORDER BY rowid LIMIT 1",
+                [name],
+                project_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Insert a portable project received from a peer. Paths are device-local and absent.
+    pub fn insert_synced_project(&self, project: &SyncProject<'_>) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO projects(
+                 id, name, git_remote, branch, package_manager, profile_ref, local_path,
+                 created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?7)",
+            params![
+                project.id,
+                project.name,
+                project.git_remote,
+                project.branch,
+                project.package_manager,
+                project.profile_ref,
+                project.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Replace only portable fields. The existing path belongs to this device and survives.
+    pub fn update_synced_project(&self, project: &SyncProject<'_>) -> Result<()> {
+        self.connection.execute(
+            "UPDATE projects
+             SET name = ?1, git_remote = ?2, branch = ?3, package_manager = ?4,
+                 profile_ref = ?5, updated_at = ?6
+             WHERE id = ?7",
+            params![
+                project.name,
+                project.git_remote,
+                project.branch,
+                project.package_manager,
+                project.profile_ref,
+                project.updated_at,
+                project.id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Set this device's path projection without making it a replicated manifest edit.
+    pub fn set_project_local_path(&self, id: &str, local_path: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE projects SET local_path = ?1 WHERE id = ?2",
+            params![local_path, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .connection
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()?)
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO settings(key, value, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                                updated_at = excluded.updated_at",
+            params![key, value, timestamp()],
+        )?;
+        Ok(())
     }
 
     /// Return only each configured secret's name and latest ciphertext.
@@ -680,6 +798,7 @@ fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         package_manager: row.get(4)?,
         profile_ref: row.get(5)?,
         local_path: row.get(6)?,
+        updated_at: row.get(7)?,
     })
 }
 
@@ -817,7 +936,8 @@ mod tests {
     fn migration_embedded_and_nonempty() {
         assert!(MIGRATION_001_INIT.contains("CREATE TABLE"));
         assert!(MIGRATION_002_PROJECT_PATHS.contains("ALTER TABLE"));
-        assert_eq!(migrations().len(), 2);
+        assert!(MIGRATION_003_MANIFEST_SYNC.contains("CREATE TABLE settings"));
+        assert_eq!(migrations().len(), 3);
         assert_eq!(civil_date_from_unix_days(0), (1970, 1, 1));
     }
 
@@ -895,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_002_applies_after_migration_001() {
+    fn migrations_002_and_003_apply_to_an_existing_project() {
         let path = std::env::temp_dir().join(format!("purser-{}.db", Id::generate()));
         let connection = Connection::open(&path).unwrap();
         connection
@@ -913,10 +1033,21 @@ mod tests {
                 [],
             )
             .unwrap();
+        let created_at = "2026-07-15T12:00:00.000000000Z";
+        connection
+            .execute(
+                "INSERT INTO projects(id, name, created_at) VALUES ('01EXISTING', 'existing', ?1)",
+                [created_at],
+            )
+            .unwrap();
         drop(connection);
 
         let store = Store::open_at(&path).unwrap();
-        assert_eq!(store.list_projects().unwrap(), Vec::<Project>::new());
+        let projects = store.list_projects().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].updated_at, created_at);
+        assert_eq!(projects[0].local_path, None);
+        assert_eq!(store.setting("projects_root").unwrap(), None);
         drop(store);
         std::fs::remove_file(path).unwrap();
     }
@@ -950,6 +1081,29 @@ mod tests {
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].name, "second");
         assert_eq!(projects[0].package_manager.as_deref(), Some("pnpm"));
+    }
+
+    #[test]
+    fn settings_round_trip_and_project_timestamps_are_initialized() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.setting("projects_root").unwrap(), None);
+        store
+            .set_setting("projects_root", "/work/projects")
+            .unwrap();
+        assert_eq!(
+            store.setting("projects_root").unwrap().as_deref(),
+            Some("/work/projects")
+        );
+        store.set_setting("projects_root", "/new/projects").unwrap();
+        assert_eq!(
+            store.setting("projects_root").unwrap().as_deref(),
+            Some("/new/projects")
+        );
+
+        store
+            .upsert_project("example", None, None, None, None, "/work/example")
+            .unwrap();
+        assert!(unix_nanos_from_timestamp(&store.list_projects().unwrap()[0].updated_at).is_some());
     }
 
     #[test]

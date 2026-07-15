@@ -1,5 +1,6 @@
 //! Purser command-line interface for the local, single-machine vault.
 
+mod project_sync;
 mod secret_sync;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -22,6 +23,7 @@ use std::time::{Duration, Instant};
 use zeroize::{Zeroize, Zeroizing};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const PROJECTS_ROOT_SETTING: &str = "projects_root";
 const FOOTER: &str = "built with Rust. Rust good. 🦀";
 
 #[derive(Parser)]
@@ -55,8 +57,10 @@ enum TopCommand {
     Project(ProjectArgs),
     /// Inspect this device or prove peer-to-peer connectivity.
     Device(DeviceArgs),
-    /// Replicate encrypted secret histories with a paired device.
+    /// Replicate encrypted secrets and project manifests with a paired device.
     Sync(SyncArgs),
+    /// Set or print the device-local directory used for newly cloned projects.
+    ProjectsRoot(ProjectsRootArgs),
     /// Show registered projects and secret configuration status.
     Status,
     /// Clone missing projects and install their dependencies.
@@ -201,6 +205,11 @@ struct UpArgs {
 }
 
 #[derive(Debug, Args)]
+struct ProjectsRootArgs {
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 struct HookArgs {
     shell: HookShell,
 }
@@ -258,6 +267,7 @@ fn execute(cli: Cli) -> Result<i32> {
         TopCommand::Project(args) => project(args),
         TopCommand::Device(args) => device(args),
         TopCommand::Sync(args) => sync(args),
+        TopCommand::ProjectsRoot(args) => projects_root(args),
         TopCommand::Status => status(),
         TopCommand::Up(args) => up(args),
         TopCommand::Hook(args) => hook(args),
@@ -339,12 +349,14 @@ async fn sync_serve(key: iroh::SecretKey) -> Result<()> {
 }
 
 async fn serve_sync_connection(connection: SyncConnection) -> Result<()> {
-    let records = secret_sync::build_records(&Store::open()?)?;
-    let sent = records.len();
+    let store = Store::open()?;
+    let mut records = secret_sync::build_records(&store)?;
+    let secret_sent = records.len();
+    let project_records = project_sync::build_records(&store)?;
+    let project_sent = project_records.len();
+    records.extend(project_records);
     let incoming = connection.exchange_responder(&records).await?;
-    let mut summary = secret_sync::apply_records(&Store::open()?, &incoming)?;
-    summary.sent = sent;
-    report_sync_summary(&summary);
+    apply_and_report_sync_records(&Store::open()?, &incoming, secret_sent, project_sent)?;
     Ok(())
 }
 
@@ -358,14 +370,16 @@ async fn sync_peer(key: iroh::SecretKey, node_id: &str) -> Result<()> {
     if !paired {
         bail!("sync refused: {peer} is not a paired device");
     }
-    let records = secret_sync::build_records(&Store::open()?)?;
-    let sent = records.len();
+    let store = Store::open()?;
+    let mut records = secret_sync::build_records(&store)?;
+    let secret_sent = records.len();
+    let project_records = project_sync::build_records(&store)?;
+    let project_sent = project_records.len();
+    records.extend(project_records);
     let endpoint = bind_sync(key).await?;
     let connection = connect_sync(&endpoint, peer).await?;
     let incoming = connection.exchange_initiator(&records).await?;
-    let mut summary = secret_sync::apply_records(&Store::open()?, &incoming)?;
-    summary.sent = sent;
-    report_sync_summary(&summary);
+    apply_and_report_sync_records(&Store::open()?, &incoming, secret_sent, project_sent)?;
     endpoint.close().await;
     Ok(())
 }
@@ -375,6 +389,29 @@ fn report_sync_summary(summary: &secret_sync::SyncSummary) {
         eprintln!("warning: {warning}");
     }
     println!("{}", summary.render());
+}
+
+fn apply_and_report_sync_records(
+    store: &Store,
+    incoming: &[Record],
+    secret_sent: usize,
+    project_sent: usize,
+) -> Result<()> {
+    let (projects, secrets): (Vec<_>, Vec<_>) = incoming
+        .iter()
+        .cloned()
+        .partition(project_sync::is_project_record);
+    let mut secret_summary = secret_sync::apply_records(store, &secrets)?;
+    secret_summary.sent = secret_sent;
+    report_sync_summary(&secret_summary);
+
+    let mut project_summary = project_sync::apply_records(store, &projects)?;
+    project_summary.sent = project_sent;
+    for warning in &project_summary.warnings {
+        eprintln!("warning: {warning}");
+    }
+    println!("{}", project_summary.render());
+    Ok(())
 }
 
 struct DeviceIdentity {
@@ -700,6 +737,33 @@ fn project_add(args: ProjectAddArgs) -> Result<i32> {
     Ok(0)
 }
 
+fn projects_root(args: ProjectsRootArgs) -> Result<i32> {
+    let store = Store::open()?;
+    let Some(path) = args.path else {
+        match store.setting(PROJECTS_ROOT_SETTING)? {
+            Some(path) => println!("{path}"),
+            None => println!(
+                "Projects root is not configured. Set it with `purser projects-root PATH`."
+            ),
+        }
+        return Ok(0);
+    };
+    if path.exists() && !path.is_dir() {
+        bail!("projects root is not a directory: {}", path.display());
+    }
+    let path = if path.exists() {
+        canonical_project_path(&path)?
+    } else {
+        absolute_path(&path)?
+    };
+    let value = path
+        .to_str()
+        .ok_or_else(|| anyhow!("projects root must be valid UTF-8"))?;
+    store.set_setting(PROJECTS_ROOT_SETTING, value)?;
+    println!("Projects root set to {}.", path.display());
+    Ok(0)
+}
+
 fn status() -> Result<i32> {
     let store = Store::open()?;
     let projects = store.list_projects()?;
@@ -748,29 +812,61 @@ fn up(args: UpArgs) -> Result<i32> {
         println!("{}:", project.name);
         // A project is reported failed at most once, however many of its steps fail.
         let mut failed = false;
-        match bring_up_project(project, args.dry_run) {
-            Ok(actions) if actions.is_empty() => println!("  nothing to do"),
-            Ok(actions) => {
-                let prefix = if args.dry_run { "would" } else { "done" };
-                for action in actions {
-                    println!("  {prefix} {action}");
-                }
+        let mut effective_project = project.clone();
+        let mut preparation_actions = Vec::new();
+        match prepare_project_for_up(&store, project, args.dry_run) {
+            Ok((prepared, actions)) => {
+                effective_project = prepared;
+                preparation_actions = actions;
             }
-            // One project failing must not stop the rest of the machine coming up.
             Err(error) => {
                 println!("  FAILED: {error:#}");
                 failed = true;
             }
         }
-        if args.write_env && project.profile_ref.is_some() {
-            match materialize_project_dotenv(&store, project, args.dry_run) {
+        let bring_up = if failed {
+            None
+        } else {
+            Some(bring_up_project(&effective_project, args.dry_run))
+        };
+        match bring_up {
+            None => {}
+            Some(Ok(actions)) if actions.is_empty() && preparation_actions.is_empty() => {
+                println!("  nothing to do")
+            }
+            Some(Ok(actions)) => {
+                let prefix = if args.dry_run { "would" } else { "done" };
+                for action in preparation_actions.into_iter().chain(actions) {
+                    println!("  {prefix} {action}");
+                }
+                if project.local_path.is_none() && !args.dry_run {
+                    let path = effective_project
+                        .local_path
+                        .as_deref()
+                        .expect("prepared project has a local path");
+                    let canonical = canonical_project_path(Path::new(path))?;
+                    let canonical = canonical
+                        .to_str()
+                        .ok_or_else(|| anyhow!("project path must be valid UTF-8"))?;
+                    store.set_project_local_path(&project.id, canonical)?;
+                    effective_project.local_path = Some(canonical.to_owned());
+                }
+            }
+            // One project failing must not stop the rest of the machine coming up.
+            Some(Err(error)) => {
+                println!("  FAILED: {error:#}");
+                failed = true;
+            }
+        }
+        if !failed && args.write_env && effective_project.profile_ref.is_some() {
+            match materialize_project_dotenv(&store, &effective_project, args.dry_run) {
                 Ok(DotenvMaterialization::Written(variable_count)) => println!(
                     "  WARNING: wrote {variable_count} variables to {}",
-                    project_dotenv_path(project)?.display()
+                    project_dotenv_path(&effective_project)?.display()
                 ),
                 Ok(DotenvMaterialization::WouldWrite(variable_count)) => println!(
                     "  WARNING: would write {variable_count} variables to {}",
-                    project_dotenv_path(project)?.display()
+                    project_dotenv_path(&effective_project)?.display()
                 ),
                 Ok(DotenvMaterialization::Skipped(reason)) => {
                     println!("  skipped .env: {reason}")
@@ -784,7 +880,7 @@ fn up(args: UpArgs) -> Result<i32> {
         if failed {
             failures.push(project.name.clone());
         }
-        report_profile_status(&store, project)?;
+        report_profile_status(&store, &effective_project)?;
     }
     if failures.is_empty() {
         Ok(0)
@@ -792,6 +888,88 @@ fn up(args: UpArgs) -> Result<i32> {
         eprintln!("Failed projects: {}", failures.join(", "));
         Ok(1)
     }
+}
+
+fn prepare_project_for_up(
+    store: &Store,
+    project: &Project,
+    dry_run: bool,
+) -> Result<(Project, Vec<String>)> {
+    if project.local_path.is_some() {
+        return Ok((project.clone(), Vec::new()));
+    }
+    let remote = project.git_remote.as_deref().ok_or_else(|| {
+        anyhow!(
+            "project has no local path and no git remote; register it locally with `purser project add PATH`"
+        )
+    })?;
+    let root = store.setting(PROJECTS_ROOT_SETTING)?.ok_or_else(|| {
+        anyhow!(
+            "project needs cloning, but no projects root is configured; run `purser projects-root PATH`"
+        )
+    })?;
+    validate_project_directory_name(&project.name)?;
+    let target = Path::new(&root).join(&project.name);
+    let target_text = target
+        .to_str()
+        .ok_or_else(|| anyhow!("project clone path must be valid UTF-8"))?;
+    let mut prepared = project.clone();
+    prepared.local_path = Some(target_text.to_owned());
+    let mut actions = Vec::new();
+
+    if target.exists() && !directory_is_empty(&target)? {
+        if !target.is_dir() {
+            bail!(
+                "clone target exists and is not a directory: {}",
+                target.display()
+            );
+        }
+        let found_remote =
+            git_output(&target, &["remote", "get-url", "origin"]).with_context(|| {
+                format!(
+                    "clone target {} is non-empty and is not the expected git repository",
+                    target.display()
+                )
+            })?;
+        if found_remote != remote {
+            bail!(
+                "clone target {} is non-empty and belongs to a different repository (expected {remote}, found {found_remote}); skipped",
+                target.display()
+            );
+        }
+        actions.push(format!("adopt existing repository at {}", target.display()));
+        if !dry_run {
+            let canonical = canonical_project_path(&target)?;
+            let canonical = canonical
+                .to_str()
+                .ok_or_else(|| anyhow!("project path must be valid UTF-8"))?;
+            store.set_project_local_path(&project.id, canonical)?;
+            prepared.local_path = Some(canonical.to_owned());
+        }
+    }
+    Ok((prepared, actions))
+}
+
+fn validate_project_directory_name(name: &str) -> Result<()> {
+    let path = Path::new(name);
+    if path.file_name().and_then(OsStr::to_str) != Some(name)
+        || path.components().count() != 1
+        || name == "."
+        || name == ".."
+    {
+        bail!("project name cannot be used as a clone directory: {name}");
+    }
+    Ok(())
+}
+
+fn directory_is_empty(path: &Path) -> Result<bool> {
+    if !path.is_dir() {
+        return Ok(false);
+    }
+    Ok(fs::read_dir(path)
+        .with_context(|| format!("could not inspect clone target {}", path.display()))?
+        .next()
+        .is_none())
 }
 
 enum DotenvMaterialization {
@@ -907,7 +1085,7 @@ fn bring_up_project(project: &Project, dry_run: bool) -> Result<Vec<String>> {
     let path = Path::new(local_path);
     let mut actions = Vec::new();
 
-    if !path.exists() {
+    if !path.exists() || directory_is_empty(path)? {
         let git_remote = project.git_remote.as_deref().ok_or_else(|| {
             anyhow!("project directory is missing and there is no git remote to clone from")
         })?;
@@ -918,22 +1096,16 @@ fn bring_up_project(project: &Project, dry_run: bool) -> Result<Vec<String>> {
                     format!("could not create project parent {}", parent.display())
                 })?;
             }
-            run_command(
-                Command::new("git").arg("clone").arg(git_remote).arg(path),
-                "git clone",
-            )?;
+            let mut command = program_command("git")?;
+            command.arg("clone").arg(git_remote).arg(path);
+            run_command(&mut command, "git clone")?;
         }
         if let Some(branch) = project.branch.as_deref() {
             actions.push(format!("check out {branch}"));
             if !dry_run {
-                run_command(
-                    Command::new("git")
-                        .arg("-C")
-                        .arg(path)
-                        .arg("checkout")
-                        .arg(branch),
-                    "git checkout",
-                )?;
+                let mut command = program_command("git")?;
+                command.arg("-C").arg(path).arg("checkout").arg(branch);
+                run_command(&mut command, "git checkout")?;
             }
         }
     }
@@ -1102,7 +1274,8 @@ fn git_metadata(path: &Path) -> (Option<String>, Option<String>) {
 }
 
 fn git_output(path: &Path, arguments: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+    let mut command = program_command("git")?;
+    let output = command
         .arg("-C")
         .arg(path)
         .args(arguments)
@@ -1686,6 +1859,7 @@ fn exit_code(status: ExitStatus) -> i32 {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use purser_store::SyncProject;
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2053,6 +2227,76 @@ mod tests {
     }
 
     #[test]
+    fn a_synced_project_without_a_path_clones_into_the_configured_root() {
+        let fixture = temporary_directory("synced-project-clone");
+        let remote = fixture.join("remote.git");
+        let projects_root = fixture.join("projects");
+        let mut init = program_command("git").unwrap();
+        init.arg("init").arg("--bare").arg(&remote);
+        run_command(&mut init, "initialize test remote").unwrap();
+
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert_synced_project(&SyncProject {
+                id: "01PORTABLE",
+                name: "portable",
+                git_remote: Some(remote.to_str().unwrap()),
+                branch: None,
+                package_manager: None,
+                profile_ref: None,
+                updated_at: "2026-07-15T12:00:00.000000000Z",
+            })
+            .unwrap();
+        store
+            .set_setting(PROJECTS_ROOT_SETTING, projects_root.to_str().unwrap())
+            .unwrap();
+
+        let project = store.find_project_by_id("01PORTABLE").unwrap().unwrap();
+        assert!(project.local_path.is_none());
+        let (prepared, preparation_actions) =
+            prepare_project_for_up(&store, &project, false).unwrap();
+        assert!(preparation_actions.is_empty());
+        let actions = bring_up_project(&prepared, false).unwrap();
+        assert!(actions[0].starts_with("clone "));
+        let cloned = projects_root.join("portable");
+        assert!(cloned.join(".git").is_dir());
+        let canonical = canonical_project_path(&cloned).unwrap();
+        store
+            .set_project_local_path("01PORTABLE", canonical.to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            store
+                .find_project_by_id("01PORTABLE")
+                .unwrap()
+                .unwrap()
+                .local_path,
+            Some(canonical.to_string_lossy().into_owned())
+        );
+        fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn a_synced_project_needing_clone_reports_how_to_configure_the_root() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert_synced_project(&SyncProject {
+                id: "01PORTABLE",
+                name: "portable",
+                git_remote: Some("https://example.invalid/portable.git"),
+                branch: None,
+                package_manager: None,
+                profile_ref: None,
+                updated_at: "2026-07-15T12:00:00.000000000Z",
+            })
+            .unwrap();
+        let project = store.find_project_by_id("01PORTABLE").unwrap().unwrap();
+        let error = prepare_project_for_up(&store, &project, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("purser projects-root PATH"));
+    }
+
+    #[test]
     fn every_hook_has_a_passthrough_for_every_wrapped_tool() {
         let posix = posix_hook();
         let powershell = powershell_hook();
@@ -2133,6 +2377,22 @@ mod tests {
                 peer: Some(node_id),
                 command: None,
             }) if node_id == "node-id"
+        ));
+    }
+
+    #[test]
+    fn projects_root_accepts_zero_or_one_path() {
+        assert!(matches!(
+            Cli::try_parse_from(["purser", "projects-root"])
+                .unwrap()
+                .command,
+            TopCommand::ProjectsRoot(ProjectsRootArgs { path: None })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["purser", "projects-root", "D:/projects"])
+                .unwrap()
+                .command,
+            TopCommand::ProjectsRoot(ProjectsRootArgs { path: Some(_) })
         ));
     }
 }
