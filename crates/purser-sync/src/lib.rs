@@ -16,6 +16,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const ALPN: &[u8] = b"purser/transport/1";
 const PAIRING_ALPN: &[u8] = b"purser/pair/1";
+const SYNC_ALPN: &[u8] = b"purser/sync/1";
 const PAIRING_KDF_INFO: &[u8] = b"purser/pair/1/v1";
 const PAIRING_PROOF_LABEL: &[u8] = b"purser/pair/1/b";
 const KEY_BYTES: usize = 32;
@@ -23,6 +24,7 @@ const AEAD_NONCE_BYTES: usize = 24;
 const AEAD_TAG_BYTES: usize = 16;
 const MAX_LABEL_BYTES: usize = 1024;
 const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
+const MAX_RECORDS_PER_EXCHANGE: usize = 1_000_000;
 
 /// A decoded one-time pairing code. Its secret bytes are scrubbed on drop and it
 /// deliberately has no `Debug` implementation.
@@ -189,6 +191,141 @@ impl Transport for IrohTransport {
             .context("could not read an iroh record")?;
         decode(&encoded)
     }
+}
+
+/// A connection negotiated exclusively for opaque record replication.
+///
+/// Authorization deliberately remains the caller's responsibility: `purser-sync` does not
+/// own a device database. The accepting caller must check `peer_id()` before calling
+/// `exchange_responder`; `refuse` closes the connection without writing application data.
+#[derive(Debug)]
+pub struct SyncConnection {
+    connection: iroh::endpoint::Connection,
+}
+
+impl SyncConnection {
+    pub fn peer_id(&self) -> EndpointId {
+        self.connection.remote_id()
+    }
+
+    pub fn refuse(self) {
+        self.connection.close(0_u8.into(), b"peer is not paired");
+    }
+
+    /// Run the dialer's half of one full, bidirectional exchange.
+    pub async fn exchange_initiator(self, records: &[Record]) -> Result<Vec<Record>> {
+        let (mut send, mut recv) = self
+            .connection
+            .open_bi()
+            .await
+            .context("could not open the sync exchange stream")?;
+        exchange_batches(&mut send, &mut recv, records).await
+    }
+
+    /// Run the listener's half of one full, bidirectional exchange.
+    pub async fn exchange_responder(self, records: &[Record]) -> Result<Vec<Record>> {
+        let (mut send, mut recv) = self
+            .connection
+            .accept_bi()
+            .await
+            .context("sync peer did not open an exchange stream")?;
+        exchange_batches(&mut send, &mut recv, records).await
+    }
+}
+
+/// Bind an endpoint that negotiates only the replication protocol. It cannot accept the
+/// unauthenticated hello protocol or the pairing protocol.
+pub async fn bind_sync(secret_key: SecretKey) -> Result<Endpoint> {
+    Endpoint::builder(presets::N0)
+        .secret_key(secret_key)
+        .alpns(vec![SYNC_ALPN.to_vec()])
+        .bind()
+        .await
+        .context("could not bind the iroh sync endpoint")
+}
+
+pub async fn accept_sync(endpoint: &Endpoint) -> Result<SyncConnection> {
+    let incoming = endpoint
+        .accept()
+        .await
+        .ok_or_else(|| anyhow!("the iroh sync endpoint closed while listening"))?;
+    let connection = incoming
+        .await
+        .context("could not complete the incoming iroh sync handshake")?;
+    Ok(SyncConnection { connection })
+}
+
+pub async fn connect_sync(
+    endpoint: &Endpoint,
+    peer: impl Into<EndpointAddr>,
+) -> Result<SyncConnection> {
+    let connection = endpoint
+        .connect(peer, SYNC_ALPN)
+        .await
+        .context("could not connect to the iroh sync peer")?;
+    Ok(SyncConnection { connection })
+}
+
+async fn exchange_batches(
+    send: &mut iroh::endpoint::SendStream,
+    recv: &mut iroh::endpoint::RecvStream,
+    records: &[Record],
+) -> Result<Vec<Record>> {
+    tokio::try_join!(write_batch(send, records), read_batch(recv)).map(|(_, received)| received)
+}
+
+async fn write_batch(send: &mut iroh::endpoint::SendStream, records: &[Record]) -> Result<()> {
+    if records.len() > MAX_RECORDS_PER_EXCHANGE {
+        bail!("sync exchange contains too many records");
+    }
+    send.write_all(&(records.len() as u64).to_be_bytes())
+        .await
+        .context("could not send the sync record count")?;
+    for record in records {
+        let encoded = encode(record)?;
+        let length = u32::try_from(encoded.len()).context("sync record is too large")?;
+        send.write_all(&length.to_be_bytes())
+            .await
+            .context("could not send a sync record length")?;
+        send.write_all(&encoded)
+            .await
+            .context("could not send a sync record")?;
+    }
+    send.finish().context("could not finish the sync batch")?;
+    // The exchange owner may drop its connection immediately after both halves finish.
+    // Do not return until the peer has consumed this stream, or queued records can be
+    // closed away on fast local connections (the same lifetime rule as `Transport::send`).
+    let _ = send.stopped().await;
+    Ok(())
+}
+
+async fn read_batch(recv: &mut iroh::endpoint::RecvStream) -> Result<Vec<Record>> {
+    let mut count = [0_u8; 8];
+    recv.read_exact(&mut count)
+        .await
+        .context("sync peer did not provide a record count")?;
+    let count = usize::try_from(u64::from_be_bytes(count))
+        .context("sync peer record count does not fit this platform")?;
+    if count > MAX_RECORDS_PER_EXCHANGE {
+        bail!("sync peer offered too many records");
+    }
+    let mut records = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut length = [0_u8; 4];
+        recv.read_exact(&mut length)
+            .await
+            .context("sync peer did not provide a record length")?;
+        let length = u32::from_be_bytes(length) as usize;
+        if length > MAX_RECORD_BYTES {
+            bail!("sync peer record exceeds the transport limit");
+        }
+        let mut encoded = vec![0_u8; length];
+        recv.read_exact(&mut encoded)
+            .await
+            .context("sync peer sent a truncated record")?;
+        records.push(decode(&encoded)?);
+    }
+    Ok(records)
 }
 
 /// Bind an endpoint that negotiates only the pairing protocol. It cannot accept the

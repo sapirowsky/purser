@@ -36,6 +36,33 @@ pub struct SecretSummary {
     pub configured: bool,
 }
 
+/// One at-rest version joined with the metadata needed to construct an encrypted sync
+/// payload. Values remain ciphertext in this crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncSecretVersion {
+    pub secret_id: String,
+    pub name: String,
+    pub profile: String,
+    pub group: Option<String>,
+    pub version: i64,
+    pub ciphertext: Vec<u8>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretIdentity {
+    pub id: String,
+    pub name: String,
+    pub profile: String,
+    pub group: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSecretVersion {
+    pub ciphertext: Vec<u8>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditEvent {
     pub id: String,
@@ -197,6 +224,153 @@ impl Store {
             [],
             |row| row.get(0),
         )?)
+    }
+
+    /// Return every secret version for full-exchange replication. No cursor is consulted.
+    pub fn all_secret_versions_for_sync(&self) -> Result<Vec<SyncSecretVersion>> {
+        let mut statement = self.connection.prepare(
+            "SELECT s.id, s.name, s.profile, s.group_name,
+                    v.version, v.ciphertext, v.created_at
+             FROM secrets s
+             JOIN secret_versions v ON v.secret_id = s.id
+             ORDER BY s.id, v.version",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(SyncSecretVersion {
+                secret_id: row.get(0)?,
+                name: row.get(1)?,
+                profile: row.get(2)?,
+                group: row.get(3)?,
+                version: row.get(4)?,
+                ciphertext: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn find_secret_by_id(&self, id: &str) -> Result<Option<SecretIdentity>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT id, name, profile, group_name FROM secrets WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok(SecretIdentity {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        profile: row.get(2)?,
+                        group: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn find_secret_by_name_profile(
+        &self,
+        name: &str,
+        profile: &str,
+    ) -> Result<Option<SecretIdentity>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT id, name, profile, group_name
+                 FROM secrets WHERE name = ?1 AND profile = ?2 ORDER BY rowid LIMIT 1",
+                params![name, profile],
+                |row| {
+                    Ok(SecretIdentity {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        profile: row.get(2)?,
+                        group: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn find_secret_version(
+        &self,
+        secret_id: &str,
+        version: i64,
+    ) -> Result<Option<StoredSecretVersion>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT ciphertext, created_at FROM secret_versions
+                 WHERE secret_id = ?1 AND version = ?2",
+                params![secret_id, version],
+                |row| {
+                    Ok(StoredSecretVersion {
+                        ciphertext: row.get(0)?,
+                        created_at: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Insert metadata using the portable ULID supplied by an authorized peer.
+    pub fn insert_synced_secret(
+        &self,
+        id: &str,
+        name: &str,
+        profile: &str,
+        group: Option<&str>,
+        created_at: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO secrets(id, name, group_name, profile, configured, created_at)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+            params![id, name, group, profile, created_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_synced_secret_version(
+        &self,
+        secret_id: &str,
+        version: i64,
+        ciphertext: &[u8],
+        created_at: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO secret_versions(id, secret_id, version, ciphertext, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![Id::generate().0, secret_id, version, ciphertext, created_at],
+        )?;
+        Ok(())
+    }
+
+    /// Receiving any value version makes the local projection configured.
+    pub fn mark_synced_secret_configured(
+        &self,
+        secret_id: &str,
+        group: Option<&str>,
+    ) -> Result<()> {
+        self.connection.execute(
+            "UPDATE secrets SET configured = 1, group_name = COALESCE(?1, group_name)
+             WHERE id = ?2",
+            params![group, secret_id],
+        )?;
+        Ok(())
+    }
+
+    /// LWW replacement for one concurrently-created `(secret_id, version)` row.
+    pub fn replace_synced_secret_version(
+        &self,
+        secret_id: &str,
+        version: i64,
+        ciphertext: &[u8],
+        created_at: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "UPDATE secret_versions SET ciphertext = ?1, created_at = ?2
+             WHERE secret_id = ?3 AND version = ?4",
+            params![ciphertext, created_at, secret_id, version],
+        )?;
+        Ok(())
     }
 
     pub fn list_secrets(&self, profile: &str) -> Result<Vec<SecretSummary>> {

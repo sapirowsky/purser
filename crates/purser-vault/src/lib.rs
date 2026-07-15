@@ -148,7 +148,12 @@ fn install_if_absent(
     install()
 }
 
-fn encrypt_with_key(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
+/// Encrypt with caller-supplied vault material without accessing the OS keyring.
+///
+/// Normal callers should use [`encrypt`]. This entry point exists so protocol integration
+/// tests can exercise the exact production AEAD while remaining isolated from real keys.
+#[doc(hidden)]
+pub fn encrypt_with_key(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
     let mut nonce_bytes = [0_u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce_bytes);
@@ -162,7 +167,11 @@ fn encrypt_with_key(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-fn decrypt_with_key(key: &[u8; KEY_LEN], encrypted: &[u8]) -> Result<Vec<u8>> {
+/// Decrypt with caller-supplied vault material without accessing the OS keyring.
+///
+/// Normal callers should use [`decrypt`].
+#[doc(hidden)]
+pub fn decrypt_with_key(key: &[u8; KEY_LEN], encrypted: &[u8]) -> Result<Vec<u8>> {
     if encrypted.len() < NONCE_LEN {
         return Err(VaultError::MalformedCiphertext);
     }

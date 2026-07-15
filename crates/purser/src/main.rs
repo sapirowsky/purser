@@ -1,11 +1,14 @@
 //! Purser command-line interface for the local, single-machine vault.
 
+mod secret_sync;
+
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use purser_store::{AuditEvent, Project, Store};
 use purser_sync::{
-    accept_pairing, bind_pairing, connect_pairing, request_pairing, serve_pairing, IrohTransport,
-    PairingCode, PairingKeyMaterial, Record, Transport,
+    accept_pairing, accept_sync, bind_pairing, bind_sync, connect_pairing, connect_sync,
+    request_pairing, serve_pairing, IrohTransport, PairingCode, PairingKeyMaterial, Record,
+    SyncConnection, Transport,
 };
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
@@ -52,6 +55,8 @@ enum TopCommand {
     Project(ProjectArgs),
     /// Inspect this device or prove peer-to-peer connectivity.
     Device(DeviceArgs),
+    /// Replicate encrypted secret histories with a paired device.
+    Sync(SyncArgs),
     /// Show registered projects and secret configuration status.
     Status,
     /// Clone missing projects and install their dependencies.
@@ -172,6 +177,21 @@ enum DeviceCommand {
 }
 
 #[derive(Debug, Args)]
+struct SyncArgs {
+    /// NodeId of a paired device to exchange records with.
+    #[arg(long)]
+    peer: Option<String>,
+    #[command(subcommand)]
+    command: Option<SyncCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum SyncCommand {
+    /// Serve paired peers until Ctrl-C.
+    Serve,
+}
+
+#[derive(Debug, Args)]
 struct UpArgs {
     #[arg(long)]
     dry_run: bool,
@@ -237,11 +257,124 @@ fn execute(cli: Cli) -> Result<i32> {
         TopCommand::Audit(args) => audit(args),
         TopCommand::Project(args) => project(args),
         TopCommand::Device(args) => device(args),
+        TopCommand::Sync(args) => sync(args),
         TopCommand::Status => status(),
         TopCommand::Up(args) => up(args),
         TopCommand::Hook(args) => hook(args),
         TopCommand::InProject => in_project(),
     }
+}
+
+fn sync(args: SyncArgs) -> Result<i32> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("could not start the sync networking runtime")?
+        .block_on(sync_async(args))
+}
+
+async fn sync_async(args: SyncArgs) -> Result<i32> {
+    let identity = ensure_device_identity(None)?;
+    match (args.command, args.peer) {
+        (Some(SyncCommand::Serve), None) => sync_serve(identity.key).await?,
+        (None, Some(peer)) => sync_peer(identity.key, &peer).await?,
+        (Some(SyncCommand::Serve), Some(_)) => {
+            bail!("--peer cannot be used with `sync serve`");
+        }
+        (None, None) => bail!("either `sync serve` or `sync --peer <NODE_ID>` is required"),
+    }
+    Ok(0)
+}
+
+async fn sync_serve(key: iroh::SecretKey) -> Result<()> {
+    let endpoint = bind_sync(key).await?;
+    if tokio::time::timeout(Duration::from_secs(15), endpoint.online())
+        .await
+        .is_err()
+    {
+        eprintln!("warning: no relay became reachable; direct local connections may still work");
+    }
+    println!("Listening for paired sync peers as {}", endpoint.id());
+    std::io::stdout().flush()?;
+
+    loop {
+        tokio::select! {
+            result = accept_sync(&endpoint) => {
+                match result {
+                    Ok(connection) => {
+                        let peer = connection.peer_id();
+                        let authorized = Store::open()?
+                            .find_device_by_public_key(peer.as_bytes())?
+                            .is_some_and(|device| !device.is_self);
+                        if !authorized {
+                            connection.refuse();
+                            eprintln!("warning: refused unpaired sync peer {peer}; no records sent");
+                            continue;
+                        }
+                        tokio::select! {
+                            result = serve_sync_connection(connection) => {
+                                if let Err(error) = result {
+                                    eprintln!("warning: paired peer {peer} sync failed: {error:#}");
+                                }
+                            }
+                            result = tokio::signal::ctrl_c() => {
+                                result.context("could not listen for Ctrl-C")?;
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("warning: incoming sync handshake failed: {error:#}");
+                    }
+                }
+            }
+            result = tokio::signal::ctrl_c() => {
+                result.context("could not listen for Ctrl-C")?;
+                break;
+            }
+        }
+    }
+    endpoint.close().await;
+    Ok(())
+}
+
+async fn serve_sync_connection(connection: SyncConnection) -> Result<()> {
+    let records = secret_sync::build_records(&Store::open()?)?;
+    let sent = records.len();
+    let incoming = connection.exchange_responder(&records).await?;
+    let mut summary = secret_sync::apply_records(&Store::open()?, &incoming)?;
+    summary.sent = sent;
+    report_sync_summary(&summary);
+    Ok(())
+}
+
+async fn sync_peer(key: iroh::SecretKey, node_id: &str) -> Result<()> {
+    let peer: iroh::PublicKey = node_id
+        .parse()
+        .context("NODE_ID must be an iroh public key")?;
+    let paired = Store::open()?
+        .find_device_by_public_key(peer.as_bytes())?
+        .is_some_and(|device| !device.is_self);
+    if !paired {
+        bail!("sync refused: {peer} is not a paired device");
+    }
+    let records = secret_sync::build_records(&Store::open()?)?;
+    let sent = records.len();
+    let endpoint = bind_sync(key).await?;
+    let connection = connect_sync(&endpoint, peer).await?;
+    let incoming = connection.exchange_initiator(&records).await?;
+    let mut summary = secret_sync::apply_records(&Store::open()?, &incoming)?;
+    summary.sent = sent;
+    report_sync_summary(&summary);
+    endpoint.close().await;
+    Ok(())
+}
+
+fn report_sync_summary(summary: &secret_sync::SyncSummary) {
+    for warning in &summary.warnings {
+        eprintln!("warning: {warning}");
+    }
+    println!("{}", summary.render());
 }
 
 struct DeviceIdentity {
@@ -1554,7 +1687,9 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
     use std::collections::BTreeMap;
+    use std::net::SocketAddr;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
 
     static TEMPORARY_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -1582,6 +1717,157 @@ mod tests {
         let package_manager = detect_package_manager(&directory);
         fs::remove_dir_all(directory).unwrap();
         package_manager
+    }
+
+    fn direct_addr(endpoint: &iroh::Endpoint) -> iroh::EndpointAddr {
+        let port = endpoint
+            .bound_sockets()
+            .into_iter()
+            .find(SocketAddr::is_ipv4)
+            .unwrap()
+            .port();
+        iroh::EndpointAddr::new(endpoint.id())
+            .with_ip_addr(SocketAddr::from(([127, 0, 0, 1], port)))
+    }
+
+    const TEST_VAULT_KEY: [u8; 32] = [0x6D; 32];
+
+    fn test_seal(bytes: &[u8]) -> Result<Vec<u8>> {
+        Ok(purser_vault::encrypt_with_key(&TEST_VAULT_KEY, bytes)?)
+    }
+
+    fn test_open(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        Ok(Zeroizing::new(purser_vault::decrypt_with_key(
+            &TEST_VAULT_KEY,
+            bytes,
+        )?))
+    }
+
+    #[test]
+    fn real_sync_endpoints_reconstruct_a_secret_on_the_receiver() {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    let sender = Store::open_in_memory().unwrap();
+                    let receiver = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+                    sender
+                        .insert_synced_secret(
+                            "01PORTABLE",
+                            "SYNCED_VALUE",
+                            "synctest",
+                            Some("test"),
+                            "2026-07-15T12:00:00.000000000Z",
+                        )
+                        .unwrap();
+                    sender
+                        .insert_synced_secret_version(
+                            "01PORTABLE",
+                            1,
+                            &test_seal(b"it-worked").unwrap(),
+                            "2026-07-15T12:00:00.000000000Z",
+                        )
+                        .unwrap();
+                    let records =
+                        secret_sync::build_records_with(&sender, test_open, test_seal).unwrap();
+                    let sender_at_rest = sender.all_secret_versions_for_sync().unwrap()[0]
+                        .ciphertext
+                        .clone();
+                    assert!(!records[0]
+                        .ciphertext
+                        .windows(b"SYNCED_VALUE".len())
+                        .any(|window| window == b"SYNCED_VALUE"));
+                    assert!(!records[0]
+                        .ciphertext
+                        .windows(b"it-worked".len())
+                        .any(|window| window == b"it-worked"));
+
+                    let server_endpoint = bind_sync(iroh::SecretKey::generate()).await.unwrap();
+                    let server_addr = direct_addr(&server_endpoint);
+                    let accepting = server_endpoint.clone();
+                    let receiving_store = Arc::clone(&receiver);
+                    let server = tokio::spawn(async move {
+                        let connection = accept_sync(&accepting).await.unwrap();
+                        let incoming = connection.exchange_responder(&[]).await.unwrap();
+                        let store = receiving_store.lock().unwrap();
+                        secret_sync::apply_records_with(&store, &incoming, test_open, test_seal)
+                            .unwrap()
+                    });
+
+                    let client_endpoint = bind_sync(iroh::SecretKey::generate()).await.unwrap();
+                    let connection = connect_sync(&client_endpoint, server_addr).await.unwrap();
+                    let returned = connection.exchange_initiator(&records).await.unwrap();
+                    assert!(returned.is_empty());
+                    let summary = server.await.unwrap();
+                    assert_eq!(summary.received, 1);
+                    {
+                        let store = receiver.lock().unwrap();
+                        let versions = store.all_secret_versions_for_sync().unwrap();
+                        assert_eq!(versions[0].secret_id, "01PORTABLE");
+                        assert_eq!(versions[0].name, "SYNCED_VALUE");
+                        assert_eq!(
+                            test_open(&versions[0].ciphertext).unwrap()[..],
+                            b"it-worked"[..]
+                        );
+                        assert_ne!(versions[0].ciphertext, sender_at_rest);
+                    }
+                    client_endpoint.close().await;
+                    server_endpoint.close().await;
+                })
+                .await
+                .expect("real secret sync test timed out");
+            });
+    }
+
+    #[test]
+    fn unpaired_real_sync_peer_is_refused_before_any_record_is_built_or_sent() {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    let server_store = Store::open_in_memory().unwrap();
+                    let server_endpoint = bind_sync(iroh::SecretKey::generate()).await.unwrap();
+                    let server_addr = direct_addr(&server_endpoint);
+                    let accepting = server_endpoint.clone();
+                    let records_built = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let server_flag = Arc::clone(&records_built);
+                    let server = tokio::spawn(async move {
+                        let connection = accept_sync(&accepting).await.unwrap();
+                        let peer = connection.peer_id();
+                        let authorized = server_store
+                            .find_device_by_public_key(peer.as_bytes())
+                            .unwrap()
+                            .is_some_and(|device| !device.is_self);
+                        if !authorized {
+                            connection.refuse();
+                            return;
+                        }
+                        server_flag.store(true, Ordering::SeqCst);
+                        let _ = connection.exchange_responder(&[]).await;
+                    });
+
+                    let client_endpoint = bind_sync(iroh::SecretKey::generate()).await.unwrap();
+                    let connection = connect_sync(&client_endpoint, server_addr).await.unwrap();
+                    let result = connection
+                        .exchange_initiator(&[Record {
+                            id: "must-not-receive".into(),
+                            version: 1,
+                            ciphertext: vec![9, 8, 7],
+                        }])
+                        .await;
+                    assert!(result.is_err(), "unpaired peer received a sync response");
+                    server.await.unwrap();
+                    assert!(!records_built.load(Ordering::SeqCst));
+                    client_endpoint.close().await;
+                    server_endpoint.close().await;
+                })
+                .await
+                .expect("unpaired sync refusal test timed out");
+            });
     }
 
     #[test]
@@ -1826,6 +2112,27 @@ mod tests {
                 label: None,
                 command: DeviceCommand::Pair { code: Some(code) },
             }) if code == "opaque-code"
+        ));
+    }
+
+    #[test]
+    fn sync_commands_follow_the_requested_clap_shape() {
+        let serve = Cli::try_parse_from(["purser", "sync", "serve"]).unwrap();
+        assert!(matches!(
+            serve.command,
+            TopCommand::Sync(SyncArgs {
+                peer: None,
+                command: Some(SyncCommand::Serve),
+            })
+        ));
+
+        let peer = Cli::try_parse_from(["purser", "sync", "--peer", "node-id"]).unwrap();
+        assert!(matches!(
+            peer.command,
+            TopCommand::Sync(SyncArgs {
+                peer: Some(node_id),
+                command: None,
+            }) if node_id == "node-id"
         ));
     }
 }
