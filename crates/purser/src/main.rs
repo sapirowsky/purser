@@ -4,7 +4,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use purser_store::{AuditEvent, Project, Store};
 use std::collections::HashSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -47,6 +47,10 @@ enum TopCommand {
     Status,
     /// Clone missing projects and install their dependencies.
     Up(UpArgs),
+    /// Print shell wrappers for transparent per-project execution.
+    Hook(HookArgs),
+    #[command(name = "_in-project", hide = true)]
+    InProject,
 }
 
 #[derive(Debug, Args)]
@@ -141,6 +145,18 @@ struct UpArgs {
     dry_run: bool,
 }
 
+#[derive(Debug, Args)]
+struct HookArgs {
+    shell: HookShell,
+}
+
+#[derive(Debug, Clone, clap::ValueEnum)]
+enum HookShell {
+    Bash,
+    Zsh,
+    Powershell,
+}
+
 #[derive(Debug, Subcommand)]
 enum AuditCommand {
     /// Show events from the most recently opened session.
@@ -185,7 +201,31 @@ fn execute(cli: Cli) -> Result<i32> {
         TopCommand::Project(args) => project(args),
         TopCommand::Status => status(),
         TopCommand::Up(args) => up(args),
+        TopCommand::Hook(args) => hook(args),
+        TopCommand::InProject => in_project(),
     }
+}
+
+fn in_project() -> Result<i32> {
+    let current = std::env::current_dir().context("could not read the current directory")?;
+    let store = Store::open()?;
+    Ok(i32::from(
+        find_containing_project(&store, &current)?.is_none(),
+    ))
+}
+
+/// Find the closest registered project by checking the current directory, then its parents.
+fn find_containing_project(store: &Store, path: &Path) -> Result<Option<Project>> {
+    let canonical = canonical_project_path(path)?;
+    for ancestor in canonical.ancestors() {
+        let local_path = ancestor
+            .to_str()
+            .ok_or_else(|| anyhow!("project path must be valid UTF-8"))?;
+        if let Some(project) = store.find_project_by_path(local_path)? {
+            return Ok(Some(project));
+        }
+    }
+    Ok(None)
 }
 
 fn project(args: ProjectArgs) -> Result<i32> {
@@ -454,6 +494,20 @@ fn program_command(program: &str) -> Result<Command> {
     Ok(Command::new(resolved))
 }
 
+/// Build a child command while resolving Windows command shims without a shell string.
+fn child_command(program: &OsStr) -> Command {
+    #[cfg(windows)]
+    {
+        let path = Path::new(program);
+        if path.components().count() == 1 && path.extension().is_none() {
+            if let Some(resolved) = program.to_str().and_then(resolve_program) {
+                return Command::new(resolved);
+            }
+        }
+    }
+    Command::new(program)
+}
+
 /// Canonicalize a project path into the form the manifest stores.
 fn canonical_project_path(path: &Path) -> Result<PathBuf> {
     let canonical = fs::canonicalize(path)
@@ -583,6 +637,48 @@ fn install_command(
     }
 }
 
+const DEV_TOOLS: &[&str] = &["npm", "pnpm", "bun", "yarn", "node", "vite", "cargo", "uv"];
+const AGENT_TOOLS: &[&str] = &["claude", "codex"];
+
+fn hook(args: HookArgs) -> Result<i32> {
+    let code = match args.shell {
+        HookShell::Bash | HookShell::Zsh => posix_hook(),
+        HookShell::Powershell => powershell_hook(),
+    };
+    print!("{code}");
+    Ok(0)
+}
+
+fn posix_hook() -> String {
+    let mut code = String::new();
+    for tool in DEV_TOOLS {
+        code.push_str(&format!(
+            "{tool}() {{\n  if command -v purser >/dev/null 2>&1 && purser _in-project >/dev/null 2>&1; then\n    purser run --profile auto -- {tool} \"$@\"\n  else\n    command {tool} \"$@\"\n  fi\n}}\n\n"
+        ));
+    }
+    for tool in AGENT_TOOLS {
+        code.push_str(&format!(
+            "{tool}() {{\n  if command -v purser >/dev/null 2>&1 && purser _in-project >/dev/null 2>&1; then\n    purser agent -- {tool} \"$@\"\n  else\n    command {tool} \"$@\"\n  fi\n}}\n\n"
+        ));
+    }
+    code
+}
+
+fn powershell_hook() -> String {
+    let mut code = String::new();
+    for (tools, purser_command) in [
+        (DEV_TOOLS, "run --profile auto --"),
+        (AGENT_TOOLS, "agent --"),
+    ] {
+        for tool in tools {
+            code.push_str(&format!(
+                "function global:{tool} {{\n    $purserCommand = Get-Command purser -CommandType Application -ErrorAction SilentlyContinue\n    if ($null -ne $purserCommand) {{\n        & $purserCommand.Source _in-project *> $null\n        if ($LASTEXITCODE -eq 0) {{\n            & $purserCommand.Source {purser_command} {tool} @args\n            $childExitCode = $LASTEXITCODE\n            $global:LASTEXITCODE = $childExitCode\n            return\n        }}\n    }}\n    $toolCommand = Get-Command {tool} -CommandType Application -ErrorAction SilentlyContinue\n    if ($null -eq $toolCommand) {{\n        Get-Command {tool} -CommandType Application -ErrorAction Stop | Out-Null\n        $global:LASTEXITCODE = 1\n        return\n    }}\n    & $toolCommand.Source @args\n    $childExitCode = $LASTEXITCODE\n    $global:LASTEXITCODE = $childExitCode\n    return\n}}\n\n"
+            ));
+        }
+    }
+    code
+}
+
 fn import(args: ImportArgs) -> Result<i32> {
     let mut source = Zeroizing::new(
         fs::read_to_string(&args.path)
@@ -623,7 +719,8 @@ fn secrets(args: SecretsArgs) -> Result<i32> {
     let store = Store::open()?;
     match args.command {
         SecretsCommand::List(args) => {
-            for secret in store.list_secrets(&args.profile)? {
+            let profile = resolve_named_profile(&store, &args.profile)?;
+            for secret in store.list_secrets(&profile)? {
                 let status = if secret.configured {
                     "configured"
                 } else {
@@ -634,10 +731,11 @@ fn secrets(args: SecretsArgs) -> Result<i32> {
         }
         SecretsCommand::Set(args) => {
             validate_name(&args.name)?;
+            let profile = resolve_named_profile(&store, &args.profile)?;
             let mut value = Zeroizing::new(rpassword::prompt_password("Secret value: ")?);
             let ciphertext = purser_vault::encrypt(value.as_bytes())?;
             value.zeroize();
-            let id = store.upsert_secret(&args.name, &args.profile, Some(&args.group), true)?;
+            let id = store.upsert_secret(&args.name, &profile, Some(&args.group), true)?;
             let version = store.add_secret_version(&id, &ciphertext)?;
             println!("Stored {} version {} (configured).", args.name, version);
         }
@@ -645,7 +743,31 @@ fn secrets(args: SecretsArgs) -> Result<i32> {
     Ok(0)
 }
 
+/// Resolve a `--profile` argument, mapping the literal `auto` onto the current project.
+///
+/// `run`/`shell` fall back to injecting nothing when `auto` cannot resolve, because running
+/// the tool still beats failing. A secrets command has no such fallback: reading or writing
+/// a guessed profile is worse than stopping, so an unresolvable `auto` is an error here.
+fn resolve_named_profile(store: &Store, profile: &str) -> Result<String> {
+    if profile != "auto" {
+        return Ok(profile.to_owned());
+    }
+    let current = std::env::current_dir().context("could not read the current directory")?;
+    let project = find_containing_project(store, &current)?.ok_or_else(|| {
+        anyhow!("--profile auto: the current directory is not in a registered Purser project")
+    })?;
+    project.profile_ref.ok_or_else(|| {
+        anyhow!(
+            "--profile auto: project {} has no profile; pass --profile explicitly, or re-register it with `purser project add . --profile <name>`",
+            project.name
+        )
+    })
+}
+
 fn run_with_profile(args: ProcessArgs) -> Result<i32> {
+    if args.profile == "auto" {
+        return run_with_auto_profile(&args.command, false);
+    }
     let store = Store::open()?;
     let scope = profile_scope(&args.profile);
     let session = store.open_session("human", Some(&scope))?;
@@ -656,12 +778,78 @@ fn run_with_profile(args: ProcessArgs) -> Result<i32> {
 
 fn shell(args: ProfileArgs) -> Result<i32> {
     let command = shell_command();
+    if args.profile == "auto" {
+        return run_with_auto_profile(&command, true);
+    }
     let store = Store::open()?;
     let scope = profile_scope(&args.profile);
     let session = store.open_session("human", Some(&scope))?;
     let result = spawn_with_profile(&store, &session, &args.profile, &command, true);
     store.close_session(&session)?;
     Ok(exit_code(result?))
+}
+
+fn run_with_auto_profile(command: &[OsString], interactive: bool) -> Result<i32> {
+    let current = match std::env::current_dir() {
+        Ok(current) => current,
+        Err(error) => {
+            eprintln!(
+                "Note: could not read the current directory ({error}); running without secret injection."
+            );
+            return Ok(exit_code(spawn_without_profile(command, interactive)?));
+        }
+    };
+    let store = match Store::open() {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!(
+                "Note: could not open the Purser project manifest ({error}); running without secret injection."
+            );
+            return Ok(exit_code(spawn_without_profile(command, interactive)?));
+        }
+    };
+    let project = match find_containing_project(&store, &current) {
+        Ok(project) => project,
+        Err(error) => {
+            eprintln!(
+                "Note: could not resolve the current Purser project ({error}); running without secret injection."
+            );
+            return Ok(exit_code(spawn_without_profile(command, interactive)?));
+        }
+    };
+    let Some(project) = project else {
+        eprintln!(
+            "Note: the current directory is not in a registered Purser project; running without secret injection."
+        );
+        return Ok(exit_code(spawn_without_profile(command, interactive)?));
+    };
+    let Some(profile) = project.profile_ref else {
+        eprintln!(
+            "Note: the current Purser project has no profile; running without secret injection."
+        );
+        return Ok(exit_code(spawn_without_profile(command, interactive)?));
+    };
+
+    let scope = profile_scope(&profile);
+    let session = store.open_session("human", Some(&scope))?;
+    let result = spawn_with_profile(&store, &session, &profile, command, interactive);
+    store.close_session(&session)?;
+    Ok(exit_code(result?))
+}
+
+fn spawn_without_profile(argv: &[OsString], interactive: bool) -> Result<ExitStatus> {
+    let (program, arguments) = argv
+        .split_first()
+        .ok_or_else(|| anyhow!("a child command is required"))?;
+    let mut command = child_command(program);
+    command.args(arguments);
+    if interactive {
+        command
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+    }
+    command.status().context("could not run child process")
 }
 
 fn spawn_with_profile(
@@ -684,7 +872,7 @@ fn spawn_with_profile(
         plaintexts.push((name, plaintext));
     }
 
-    let mut command = Command::new(program);
+    let mut command = child_command(program);
     command.args(arguments);
     if interactive {
         command
@@ -734,7 +922,7 @@ fn spawn_agent_child(store: &Store, argv: &[OsString]) -> Result<ExitStatus> {
         .map(|name| normalize_env_name(&name))
         .collect();
 
-    let mut command = Command::new(program);
+    let mut command = child_command(program);
     command.args(arguments);
     // Sanitize by stripping only variables whose names collide with a known secret.
     // Secret VALUES are never in this process's environment (they live in the vault),
@@ -950,6 +1138,21 @@ fn exit_code(status: ExitStatus) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMPORARY_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn temporary_directory(label: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "purser-{label}-{}-{}",
+            std::process::id(),
+            TEMPORARY_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        directory
+    }
 
     fn package_manager_for_markers(markers: &[&str]) -> Option<&'static str> {
         let directory = std::env::temp_dir().join(format!(
@@ -1059,5 +1262,77 @@ mod tests {
         let metadata = git_metadata(&directory);
         fs::remove_dir_all(&directory).unwrap();
         assert_eq!(metadata, (None, None));
+    }
+
+    #[test]
+    fn project_resolution_picks_the_closest_registered_ancestor() {
+        let root = temporary_directory("project-resolution");
+        let nested_project = root.join("workspace");
+        let child = nested_project.join("src").join("feature");
+        fs::create_dir_all(&child).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        for (path, name, profile) in [
+            (&root, "root", "root-profile"),
+            (&nested_project, "workspace", "workspace-profile"),
+        ] {
+            let canonical = canonical_project_path(path).unwrap();
+            store
+                .upsert_project(
+                    name,
+                    None,
+                    None,
+                    None,
+                    Some(profile),
+                    canonical.to_str().unwrap(),
+                )
+                .unwrap();
+        }
+
+        let project = find_containing_project(&store, &child).unwrap().unwrap();
+        assert_eq!(project.name, "workspace");
+        assert_eq!(project.profile_ref.as_deref(), Some("workspace-profile"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_resolution_outside_registered_paths_is_empty() {
+        let directory = temporary_directory("outside-project");
+        let store = Store::open_in_memory().unwrap();
+        assert!(find_containing_project(&store, &directory)
+            .unwrap()
+            .is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn every_hook_has_a_passthrough_for_every_wrapped_tool() {
+        let posix = posix_hook();
+        let powershell = powershell_hook();
+        assert!(!posix.is_empty());
+        assert!(!powershell.is_empty());
+        for tool in DEV_TOOLS.iter().chain(AGENT_TOOLS) {
+            assert!(posix.contains(&format!("command {tool} \"$@\"")));
+            assert!(powershell.contains(&format!("Get-Command {tool} -CommandType Application")));
+            assert!(powershell.contains("& $toolCommand.Source @args"));
+        }
+    }
+
+    #[test]
+    fn generated_hooks_contain_no_secret_values() {
+        let secret_value = "hook-must-never-contain-this-secret-value";
+        assert!(!posix_hook().contains(secret_value));
+        assert!(!powershell_hook().contains(secret_value));
+    }
+
+    #[test]
+    fn in_project_probe_has_the_exact_hidden_command_name() {
+        let parsed = Cli::try_parse_from(["purser", "_in-project"]).unwrap();
+        assert!(matches!(parsed.command, TopCommand::InProject));
+        let command = Cli::command();
+        let probe = command
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "_in-project")
+            .unwrap();
+        assert!(probe.is_hide_set());
     }
 }
