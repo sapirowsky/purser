@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use purser_store::{AuditEvent, Store};
+use purser_store::{AuditEvent, Project, Store};
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -41,6 +41,12 @@ enum TopCommand {
     Agent(AgentArgs),
     /// Read the value-blind audit trail.
     Audit(AuditArgs),
+    /// Register and inspect project metadata.
+    Project(ProjectArgs),
+    /// Show registered projects and secret configuration status.
+    Status,
+    /// Clone missing projects and install their dependencies.
+    Up(UpArgs),
 }
 
 #[derive(Debug, Args)]
@@ -101,6 +107,40 @@ struct AuditArgs {
     command: Option<AuditCommand>,
 }
 
+#[derive(Debug, Args)]
+struct ProjectArgs {
+    #[command(subcommand)]
+    command: ProjectCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProjectCommand {
+    /// Register or update a local project.
+    Add(ProjectAddArgs),
+    /// Unregister a project. Its files and secrets are left alone.
+    Remove(ProjectRemoveArgs),
+}
+
+#[derive(Debug, Args)]
+struct ProjectAddArgs {
+    #[arg(default_value = ".")]
+    path: PathBuf,
+    #[arg(long)]
+    profile: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ProjectRemoveArgs {
+    #[arg(default_value = ".")]
+    path: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct UpArgs {
+    #[arg(long)]
+    dry_run: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum AuditCommand {
     /// Show events from the most recently opened session.
@@ -142,6 +182,404 @@ fn execute(cli: Cli) -> Result<i32> {
         TopCommand::Shell(args) => shell(args),
         TopCommand::Agent(args) => agent(args),
         TopCommand::Audit(args) => audit(args),
+        TopCommand::Project(args) => project(args),
+        TopCommand::Status => status(),
+        TopCommand::Up(args) => up(args),
+    }
+}
+
+fn project(args: ProjectArgs) -> Result<i32> {
+    match args.command {
+        ProjectCommand::Add(args) => project_add(args),
+        ProjectCommand::Remove(args) => project_remove(args),
+    }
+}
+
+fn project_remove(args: ProjectRemoveArgs) -> Result<i32> {
+    // A project whose directory is already gone must still be removable, so fall back to
+    // plain absolutization when canonicalization cannot resolve a missing path.
+    let path = match canonical_project_path(&args.path) {
+        Ok(path) => path,
+        Err(_) => absolute_path(&args.path)?,
+    };
+    let local_path = path
+        .to_str()
+        .ok_or_else(|| anyhow!("project path must be valid UTF-8"))?;
+    let store = Store::open()?;
+    if store.remove_project_by_path(local_path)? {
+        println!(
+            "Unregistered {}. Files and secrets were left alone.",
+            path.display()
+        );
+        Ok(0)
+    } else {
+        bail!("no project is registered at {}", path.display());
+    }
+}
+
+/// Absolutize without touching the filesystem, so a deleted directory still resolves.
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_owned());
+    }
+    let current = std::env::current_dir().context("could not read the current directory")?;
+    Ok(plain_path(current.join(path)))
+}
+
+fn project_add(args: ProjectAddArgs) -> Result<i32> {
+    let path = canonical_project_path(&args.path)?;
+    if !path.is_dir() {
+        bail!("project path is not a directory: {}", path.display());
+    }
+    let local_path = path
+        .to_str()
+        .ok_or_else(|| anyhow!("project path must be valid UTF-8"))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("project path must end in a valid UTF-8 directory name"))?;
+    let (git_remote, branch) = git_metadata(&path);
+    let package_manager = detect_package_manager(&path);
+
+    let store = Store::open()?;
+    store.upsert_project(
+        name,
+        git_remote.as_deref(),
+        branch.as_deref(),
+        package_manager,
+        args.profile.as_deref(),
+        local_path,
+    )?;
+    if git_remote.is_none() {
+        println!("Note: no git remote found — `up` cannot clone {name} if it goes missing.");
+    }
+    println!("Registered {name} at {}.", path.display());
+    Ok(0)
+}
+
+fn status() -> Result<i32> {
+    let store = Store::open()?;
+    let projects = store.list_projects()?;
+    if projects.is_empty() {
+        println!("No registered projects.");
+        return Ok(0);
+    }
+    for project in projects {
+        let path_status = project
+            .local_path
+            .as_deref()
+            .is_some_and(|path| Path::new(path).exists());
+        let package_manager = project.package_manager.as_deref().unwrap_or("-");
+        if let Some(profile) = project.profile_ref.as_deref() {
+            let secrets = store.list_secrets(profile)?;
+            let configured = secrets.iter().filter(|secret| secret.configured).count();
+            let not_configured = secrets.len() - configured;
+            println!(
+                "{}\t{}\tpackage={}\tprofile={}\tsecrets={configured} configured, {not_configured} not configured",
+                project.name,
+                if path_status { "cloned" } else { "MISSING" },
+                package_manager,
+                profile
+            );
+        } else {
+            println!(
+                "{}\t{}\tpackage={}\tprofile=-\tsecrets=-",
+                project.name,
+                if path_status { "cloned" } else { "MISSING" },
+                package_manager
+            );
+        }
+    }
+    Ok(0)
+}
+
+fn up(args: UpArgs) -> Result<i32> {
+    let store = Store::open()?;
+    let projects = store.list_projects()?;
+    if projects.is_empty() {
+        println!("No registered projects. Register one with `purser project add .`.");
+        return Ok(0);
+    }
+    let mut failures = Vec::new();
+    for project in &projects {
+        println!("{}:", project.name);
+        match bring_up_project(project, args.dry_run) {
+            Ok(actions) if actions.is_empty() => println!("  nothing to do"),
+            Ok(actions) => {
+                let prefix = if args.dry_run { "would" } else { "done" };
+                for action in actions {
+                    println!("  {prefix} {action}");
+                }
+            }
+            // One project failing must not stop the rest of the machine coming up.
+            Err(error) => {
+                println!("  FAILED: {error:#}");
+                failures.push(project.name.clone());
+            }
+        }
+        report_profile_status(&store, project)?;
+    }
+    if failures.is_empty() {
+        Ok(0)
+    } else {
+        eprintln!("Failed projects: {}", failures.join(", "));
+        Ok(1)
+    }
+}
+
+/// Clone and rehydrate one project, returning a description of each action taken.
+///
+/// In `dry_run` the descriptions are still produced but nothing is executed.
+fn bring_up_project(project: &Project, dry_run: bool) -> Result<Vec<String>> {
+    let local_path = project
+        .local_path
+        .as_deref()
+        .ok_or_else(|| anyhow!("project has no local path"))?;
+    let path = Path::new(local_path);
+    let mut actions = Vec::new();
+
+    if !path.exists() {
+        let git_remote = project.git_remote.as_deref().ok_or_else(|| {
+            anyhow!("project directory is missing and there is no git remote to clone from")
+        })?;
+        actions.push(format!("clone {git_remote} into {}", path.display()));
+        if !dry_run {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("could not create project parent {}", parent.display())
+                })?;
+            }
+            run_command(
+                Command::new("git").arg("clone").arg(git_remote).arg(path),
+                "git clone",
+            )?;
+        }
+        if let Some(branch) = project.branch.as_deref() {
+            actions.push(format!("check out {branch}"));
+            if !dry_run {
+                run_command(
+                    Command::new("git")
+                        .arg("-C")
+                        .arg(path)
+                        .arg("checkout")
+                        .arg(branch),
+                    "git checkout",
+                )?;
+            }
+        }
+    }
+
+    if let Some((program, install_arguments)) = install_command(project.package_manager.as_deref())
+    {
+        actions.push(format!("run {program} {}", install_arguments.join(" ")));
+        if !dry_run {
+            let mut command = program_command(program)?;
+            command.args(install_arguments).current_dir(path);
+            run_command(&mut command, "dependency install")?;
+        }
+    }
+    Ok(actions)
+}
+
+fn report_profile_status(store: &Store, project: &Project) -> Result<()> {
+    let Some(profile) = project.profile_ref.as_deref() else {
+        println!("  profile: none");
+        return Ok(());
+    };
+    let secrets = store.list_secrets(profile)?;
+    if secrets.is_empty() {
+        println!("  profile {profile}: no secrets registered");
+        return Ok(());
+    }
+    // Names and configured-status only — a value must never reach stdout.
+    let missing: Vec<_> = secrets
+        .iter()
+        .filter(|secret| !secret.configured)
+        .map(|secret| secret.name.as_str())
+        .collect();
+    if missing.is_empty() {
+        println!(
+            "  profile {profile}: all {} secrets configured",
+            secrets.len()
+        );
+    } else {
+        println!("  profile {profile}: missing {}", missing.join(", "));
+    }
+    Ok(())
+}
+
+fn run_command(command: &mut Command, operation: &str) -> Result<()> {
+    let status = command
+        .status()
+        .with_context(|| format!("could not run {operation}"))?;
+    if !status.success() {
+        bail!("{operation} exited with {}", exit_code(status));
+    }
+    Ok(())
+}
+
+/// Resolve a program name to a concrete file, searching PATH the way a shell would.
+///
+/// Windows' `CreateProcess` only appends `.exe`, but every Node-ecosystem launcher ships as
+/// a `.cmd` shim, so `Command::new("npm")` fails outright with "program not found". Finding
+/// the shim ourselves keeps the spawn a plain argv — no `cmd /c` string to quote wrong.
+#[cfg(windows)]
+fn resolve_program(program: &str) -> Option<PathBuf> {
+    let path_extensions =
+        std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned());
+    let directories = std::env::var_os("PATH")?;
+    for directory in std::env::split_paths(&directories) {
+        for extension in path_extensions.split(';').filter(|item| !item.is_empty()) {
+            let candidate = directory.join(format!("{program}{extension}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn resolve_program(program: &str) -> Option<PathBuf> {
+    let directories = std::env::var_os("PATH")?;
+    std::env::split_paths(&directories)
+        .map(|directory| directory.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Build a `Command` for a program that may be a shim rather than a real executable.
+fn program_command(program: &str) -> Result<Command> {
+    let resolved = resolve_program(program)
+        .ok_or_else(|| anyhow!("{program} is not installed or not on PATH"))?;
+    Ok(Command::new(resolved))
+}
+
+/// Canonicalize a project path into the form the manifest stores.
+fn canonical_project_path(path: &Path) -> Result<PathBuf> {
+    let canonical = fs::canonicalize(path)
+        .with_context(|| format!("could not canonicalize project path {}", path.display()))?;
+    Ok(plain_path(canonical))
+}
+
+/// Strip Windows' `\\?\` verbatim prefix, which `fs::canonicalize` always adds.
+///
+/// A verbatim path is not interchangeable with the plain one: it does not compare equal to
+/// what `current_dir` returns (so project lookup by cwd would miss), and git rejects it as a
+/// clone target. The manifest therefore stores the plain form.
+#[cfg(windows)]
+fn plain_path(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    let Some(rest) = text.strip_prefix(r"\\?\") else {
+        return path;
+    };
+    // Only a plain drive path (`\\?\C:\dir`) shortens by truncation. A verbatim UNC share
+    // (`\\?\UNC\server\share`) needs a different rewrite, so leave that one untouched.
+    let mut characters = rest.chars();
+    let is_drive_path = characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && characters.next() == Some(':')
+        && characters.next() == Some('\\');
+    if is_drive_path {
+        PathBuf::from(rest.to_string())
+    } else {
+        path
+    }
+}
+
+#[cfg(not(windows))]
+fn plain_path(path: PathBuf) -> PathBuf {
+    path
+}
+
+/// Best-effort `(remote, branch)` for a directory.
+///
+/// A project need not be a git repository: it is registered either way, and `up` simply has
+/// nothing to clone. Only a missing directory with no remote is an error, and that surfaces
+/// in `up`, not here.
+fn git_metadata(path: &Path) -> (Option<String>, Option<String>) {
+    let Ok(remotes) = git_output(path, &["remote"]) else {
+        return (None, None);
+    };
+    let remote_name = remotes
+        .lines()
+        .find(|remote| *remote == "origin")
+        .or_else(|| remotes.lines().next())
+        .map(str::to_owned);
+    let git_remote = remote_name
+        .as_deref()
+        .and_then(|remote| git_output(path, &["remote", "get-url", remote]).ok())
+        .filter(|remote| !remote.is_empty());
+    let branch = current_branch(path).or_else(|| {
+        remote_name
+            .as_deref()
+            .and_then(|remote| remote_head_branch(path, remote))
+    });
+    (git_remote, branch)
+}
+
+fn git_output(path: &Path, arguments: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(arguments)
+        .stderr(Stdio::null())
+        .output()
+        .context("could not run git")?;
+    if !output.status.success() {
+        bail!("git metadata query failed");
+    }
+    Ok(String::from_utf8(output.stdout)
+        .context("git metadata was not valid UTF-8")?
+        .trim()
+        .to_owned())
+}
+
+fn current_branch(path: &Path) -> Option<String> {
+    git_output(path, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .ok()
+        .filter(|branch| branch != "HEAD" && !branch.is_empty())
+}
+
+fn remote_head_branch(path: &Path, remote: &str) -> Option<String> {
+    let reference = format!("refs/remotes/{remote}/HEAD");
+    let branch = git_output(path, &["symbolic-ref", "--short", &reference]).ok()?;
+    branch
+        .strip_prefix(&format!("{remote}/"))
+        .map(str::to_owned)
+}
+
+fn detect_package_manager(path: &Path) -> Option<&'static str> {
+    if path.join("pnpm-lock.yaml").is_file() {
+        Some("pnpm")
+    } else if path.join("bun.lockb").is_file() || path.join("bun.lock").is_file() {
+        Some("bun")
+    } else if path.join("yarn.lock").is_file() {
+        Some("yarn")
+    } else if path.join("package-lock.json").is_file() {
+        Some("npm")
+    } else if path.join("Cargo.toml").is_file() {
+        Some("cargo")
+    } else if path.join("uv.lock").is_file() || path.join("pyproject.toml").is_file() {
+        Some("uv")
+    } else if path.join("package.json").is_file() {
+        Some("npm")
+    } else {
+        None
+    }
+}
+
+fn install_command(
+    package_manager: Option<&str>,
+) -> Option<(&'static str, &'static [&'static str])> {
+    match package_manager {
+        Some("pnpm") => Some(("pnpm", &["install"])),
+        Some("npm") => Some(("npm", &["install"])),
+        Some("bun") => Some(("bun", &["install"])),
+        Some("yarn") => Some(("yarn", &["install"])),
+        Some("cargo") => Some(("cargo", &["fetch"])),
+        Some("uv") => Some(("uv", &["sync"])),
+        _ => None,
     }
 }
 
@@ -513,6 +951,21 @@ fn exit_code(status: ExitStatus) -> i32 {
 mod tests {
     use super::*;
 
+    fn package_manager_for_markers(markers: &[&str]) -> Option<&'static str> {
+        let directory = std::env::temp_dir().join(format!(
+            "purser-package-manager-{}-{}",
+            std::process::id(),
+            markers.join("-").replace('.', "_")
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        for marker in markers {
+            fs::write(directory.join(marker), []).unwrap();
+        }
+        let package_manager = detect_package_manager(&directory);
+        fs::remove_dir_all(directory).unwrap();
+        package_manager
+    }
+
     #[test]
     fn dotenv_parser_handles_assignments_quotes_comments_blanks_and_export() {
         let parsed = parse_dotenv(
@@ -543,5 +996,68 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(!error.contains(sensitive));
+    }
+
+    #[test]
+    fn package_manager_detection_recognizes_every_marker() {
+        for (marker, expected) in [
+            ("pnpm-lock.yaml", "pnpm"),
+            ("bun.lockb", "bun"),
+            ("bun.lock", "bun"),
+            ("yarn.lock", "yarn"),
+            ("package-lock.json", "npm"),
+            ("Cargo.toml", "cargo"),
+            ("uv.lock", "uv"),
+            ("pyproject.toml", "uv"),
+            ("package.json", "npm"),
+        ] {
+            assert_eq!(package_manager_for_markers(&[marker]), Some(expected));
+        }
+    }
+
+    #[test]
+    fn pnpm_lock_takes_precedence_over_package_lock() {
+        assert_eq!(
+            package_manager_for_markers(&["pnpm-lock.yaml", "package-lock.json"]),
+            Some("pnpm")
+        );
+    }
+
+    /// A registered path must equal what `current_dir` yields, or lookup by cwd misses.
+    #[test]
+    #[cfg(windows)]
+    fn canonical_paths_carry_no_verbatim_prefix() {
+        let directory = std::env::current_dir().unwrap();
+        let canonical = canonical_project_path(&directory).unwrap();
+        assert!(!canonical.to_string_lossy().starts_with(r"\\?\"));
+        assert_eq!(canonical, plain_path(canonical.clone()));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn verbatim_unc_shares_are_left_alone() {
+        let share = PathBuf::from(r"\\?\UNC\server\share");
+        assert_eq!(plain_path(share.clone()), share);
+        assert_eq!(
+            plain_path(PathBuf::from(r"\\?\C:\dir")),
+            PathBuf::from(r"C:\dir")
+        );
+    }
+
+    /// `Command::new("npm")` cannot spawn on Windows, where npm is a `.cmd` shim.
+    #[test]
+    fn shim_installed_programs_resolve_on_this_platform() {
+        assert!(resolve_program("git").is_some(), "git should be on PATH");
+        assert!(resolve_program("purser-definitely-not-a-real-program").is_none());
+    }
+
+    /// A project need not be a git repository; `project add` must still register it.
+    #[test]
+    fn git_metadata_of_a_non_repository_is_empty_not_an_error() {
+        let directory = std::env::temp_dir().join(format!("purser-nongit-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let metadata = git_metadata(&directory);
+        fs::remove_dir_all(&directory).unwrap();
+        assert_eq!(metadata, (None, None));
     }
 }

@@ -7,9 +7,13 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MIGRATION_001_INIT: &str = include_str!("../migrations/001_init.sql");
+pub const MIGRATION_002_PROJECT_PATHS: &str = include_str!("../migrations/002_project_paths.sql");
 
 pub fn migrations() -> &'static [(&'static str, &'static str)] {
-    &[("001_init", MIGRATION_001_INIT)]
+    &[
+        ("001_init", MIGRATION_001_INIT),
+        ("002_project_paths", MIGRATION_002_PROJECT_PATHS),
+    ]
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -40,6 +44,17 @@ pub struct AuditEvent {
     pub prev_hash: Option<String>,
     pub hash: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Project {
+    pub id: String,
+    pub name: String,
+    pub git_remote: Option<String>,
+    pub branch: Option<String>,
+    pub package_manager: Option<String>,
+    pub profile_ref: Option<String>,
+    pub local_path: Option<String>,
 }
 
 pub struct Store {
@@ -173,6 +188,88 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// Create or update a project projection and return its opaque id.
+    pub fn upsert_project(
+        &self,
+        name: &str,
+        git_remote: Option<&str>,
+        branch: Option<&str>,
+        package_manager: Option<&str>,
+        profile_ref: Option<&str>,
+        local_path: &str,
+    ) -> Result<String> {
+        let existing: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT id FROM projects WHERE local_path = ?1",
+                [local_path],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        if let Some(id) = existing {
+            self.connection.execute(
+                "UPDATE projects
+                 SET name = ?1, git_remote = ?2, branch = ?3, package_manager = ?4,
+                     profile_ref = ?5
+                 WHERE id = ?6",
+                params![name, git_remote, branch, package_manager, profile_ref, id],
+            )?;
+            Ok(id)
+        } else {
+            let id = Id::generate().0;
+            self.connection.execute(
+                "INSERT INTO projects(
+                     id, name, git_remote, branch, package_manager, profile_ref, local_path,
+                     created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    id,
+                    name,
+                    git_remote,
+                    branch,
+                    package_manager,
+                    profile_ref,
+                    local_path,
+                    timestamp()
+                ],
+            )?;
+            Ok(id)
+        }
+    }
+
+    pub fn list_projects(&self) -> Result<Vec<Project>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, name, git_remote, branch, package_manager, profile_ref, local_path
+             FROM projects ORDER BY rowid",
+        )?;
+        let rows = statement.query_map([], project_from_row)?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Unregister a project. Returns whether a row matched.
+    ///
+    /// Only the manifest projection is dropped; the working tree and the profile's secrets
+    /// are untouched.
+    pub fn remove_project_by_path(&self, path: &str) -> Result<bool> {
+        let removed = self
+            .connection
+            .execute("DELETE FROM projects WHERE local_path = ?1", [path])?;
+        Ok(removed > 0)
+    }
+
+    pub fn find_project_by_path(&self, path: &str) -> Result<Option<Project>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT id, name, git_remote, branch, package_manager, profile_ref, local_path
+                 FROM projects WHERE local_path = ?1",
+                [path],
+                project_from_row,
+            )
+            .optional()?)
+    }
+
     /// Return only each configured secret's name and latest ciphertext.
     pub fn get_active_versions(&self, profile: &str) -> Result<Vec<(String, Vec<u8>)>> {
         let mut statement = self.connection.prepare(
@@ -288,6 +385,18 @@ impl Store {
     }
 }
 
+fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
+    Ok(Project {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        git_remote: row.get(2)?,
+        branch: row.get(3)?,
+        package_manager: row.get(4)?,
+        profile_ref: row.get(5)?,
+        local_path: row.get(6)?,
+    })
+}
+
 fn timestamp() -> String {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -349,8 +458,117 @@ mod tests {
     #[test]
     fn migration_embedded_and_nonempty() {
         assert!(MIGRATION_001_INIT.contains("CREATE TABLE"));
-        assert_eq!(migrations().len(), 1);
+        assert!(MIGRATION_002_PROJECT_PATHS.contains("ALTER TABLE"));
+        assert_eq!(migrations().len(), 2);
         assert_eq!(civil_date_from_unix_days(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn migration_002_applies_after_migration_001() {
+        let path = std::env::temp_dir().join(format!("purser-{}.db", Id::generate()));
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                     name TEXT PRIMARY KEY,
+                     applied_at TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        connection.execute_batch(MIGRATION_001_INIT).unwrap();
+        connection
+            .execute(
+                "INSERT INTO schema_migrations(name, applied_at) VALUES ('001_init', 'now')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = Store::open_at(&path).unwrap();
+        assert_eq!(store.list_projects().unwrap(), Vec::<Project>::new());
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn project_upsert_updates_existing_path() {
+        let store = Store::open_in_memory().unwrap();
+        let first_id = store
+            .upsert_project(
+                "first",
+                Some("first-remote"),
+                Some("main"),
+                Some("npm"),
+                None,
+                "/projects/example",
+            )
+            .unwrap();
+        let second_id = store
+            .upsert_project(
+                "second",
+                Some("second-remote"),
+                Some("trunk"),
+                Some("pnpm"),
+                Some("local"),
+                "/projects/example",
+            )
+            .unwrap();
+
+        let projects = store.list_projects().unwrap();
+        assert_eq!(first_id, second_id);
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "second");
+        assert_eq!(projects[0].package_manager.as_deref(), Some("pnpm"));
+    }
+
+    #[test]
+    fn removing_a_project_drops_only_the_manifest_row() {
+        let store = Store::open_in_memory().unwrap();
+        let secret_id = store
+            .upsert_secret("API_TOKEN", "local", None, true)
+            .unwrap();
+        store.add_secret_version(&secret_id, b"ciphertext").unwrap();
+        store
+            .upsert_project(
+                "example",
+                None,
+                None,
+                None,
+                Some("local"),
+                "/projects/example",
+            )
+            .unwrap();
+
+        assert!(store.remove_project_by_path("/projects/example").unwrap());
+        assert_eq!(store.list_projects().unwrap(), Vec::<Project>::new());
+        // Unregistering a project must not disturb the profile's secrets.
+        assert_eq!(store.list_secrets("local").unwrap().len(), 1);
+        // A second removal reports that nothing matched rather than erroring.
+        assert!(!store.remove_project_by_path("/projects/example").unwrap());
+    }
+
+    #[test]
+    fn project_listing_never_contains_a_secret_value() {
+        let store = Store::open_in_memory().unwrap();
+        let secret_value = "project-list-must-never-contain-this-value";
+        let secret_id = store
+            .upsert_secret("API_TOKEN", "local", None, true)
+            .unwrap();
+        store
+            .add_secret_version(&secret_id, secret_value.as_bytes())
+            .unwrap();
+        store
+            .upsert_project(
+                "example",
+                None,
+                None,
+                None,
+                Some("local"),
+                "/projects/example",
+            )
+            .unwrap();
+
+        assert!(!format!("{:?}", store.list_projects().unwrap()).contains(secret_value));
     }
 
     #[test]
