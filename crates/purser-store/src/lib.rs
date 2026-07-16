@@ -9,12 +9,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const MIGRATION_001_INIT: &str = include_str!("../migrations/001_init.sql");
 pub const MIGRATION_002_PROJECT_PATHS: &str = include_str!("../migrations/002_project_paths.sql");
 pub const MIGRATION_003_MANIFEST_SYNC: &str = include_str!("../migrations/003_manifest_sync.sql");
+pub const MIGRATION_004_DEVICE_UNIQUENESS: &str =
+    include_str!("../migrations/004_device_uniqueness.sql");
 
 pub fn migrations() -> &'static [(&'static str, &'static str)] {
     &[
         ("001_init", MIGRATION_001_INIT),
         ("002_project_paths", MIGRATION_002_PROJECT_PATHS),
         ("003_manifest_sync", MIGRATION_003_MANIFEST_SYNC),
+        ("004_device_uniqueness", MIGRATION_004_DEVICE_UNIQUENESS),
     ]
 }
 
@@ -638,6 +641,10 @@ impl Store {
         let id = existing_self
             .or(existing_key)
             .unwrap_or_else(|| Id::generate().0);
+        // Remove any OTHER self rows FIRST. Promoting this row to is_self = 1 while a second
+        // self row still exists would trip the partial unique index (004); deleting first
+        // keeps the "exactly one self" invariant true at every statement boundary.
+        tx.execute("DELETE FROM devices WHERE is_self = 1 AND id != ?1", [&id])?;
         let updated = tx.execute(
             "UPDATE devices SET label = ?1, public_key = ?2, is_self = 1 WHERE id = ?3",
             params![label, public_key, id],
@@ -649,7 +656,6 @@ impl Store {
                 params![id, label, public_key, timestamp()],
             )?;
         }
-        tx.execute("DELETE FROM devices WHERE is_self = 1 AND id != ?1", [&id])?;
         tx.commit()?;
         Ok(id)
     }
@@ -687,21 +693,23 @@ impl Store {
                 |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0)),
             )
             .optional()?;
+        // The diverging `return` means `existing` is only moved past here when it did NOT
+        // match a self row, so it stays usable below.
         if let Some((_id, true)) = existing {
             return Err(StoreError::CannotPairSelf);
         }
-        if let Some((id, false)) = existing {
-            tx.execute(
-                "UPDATE devices SET label = ?1, paired_at = ?2 WHERE id = ?3",
-                params![label, timestamp(), id],
-            )?;
-            tx.commit()?;
-            return Ok(id);
-        }
-        let id = Id::generate().0;
+        let id = existing
+            .map(|(id, _)| id)
+            .unwrap_or_else(|| Id::generate().0);
+        // UNIQUE(public_key) (004) makes this idempotent even if a concurrent writer inserted
+        // the same peer between the SELECT and here: the insert folds into an update instead
+        // of raising a constraint error. The WHERE guard keeps it from ever touching a self
+        // row (whose is_self we must never clear).
         tx.execute(
             "INSERT INTO devices(id, label, public_key, is_self, paired_at)
-             VALUES (?1, ?2, ?3, 0, ?4)",
+             VALUES (?1, ?2, ?3, 0, ?4)
+             ON CONFLICT(public_key) DO UPDATE SET label = excluded.label, paired_at = excluded.paired_at
+               WHERE devices.is_self = 0",
             params![id, label, public_key, timestamp()],
         )?;
         tx.commit()?;
@@ -969,7 +977,8 @@ mod tests {
         assert!(MIGRATION_001_INIT.contains("CREATE TABLE"));
         assert!(MIGRATION_002_PROJECT_PATHS.contains("ALTER TABLE"));
         assert!(MIGRATION_003_MANIFEST_SYNC.contains("CREATE TABLE settings"));
-        assert_eq!(migrations().len(), 3);
+        assert!(MIGRATION_004_DEVICE_UNIQUENESS.contains("CREATE UNIQUE INDEX"));
+        assert_eq!(migrations().len(), 4);
         assert_eq!(civil_date_from_unix_days(0), (1970, 1, 1));
     }
 
@@ -1181,6 +1190,36 @@ mod tests {
                 .unwrap()
                 .is_self
         );
+    }
+
+    #[test]
+    fn paired_upsert_is_idempotent_by_public_key() {
+        // The same peer paired twice (e.g. a relabel) must stay one row, not two — the
+        // schema's UNIQUE(public_key) folds the second insert into an update.
+        let store = Store::open_in_memory().unwrap();
+        let first = store.upsert_paired_device("laptop", &[7_u8; 32]).unwrap();
+        let second = store
+            .upsert_paired_device("laptop-renamed", &[7_u8; 32])
+            .unwrap();
+        assert_eq!(first, second);
+        let devices = store.list_devices().unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].label, "laptop-renamed");
+        assert!(!devices[0].is_self);
+    }
+
+    #[test]
+    fn the_schema_rejects_a_duplicate_public_key() {
+        // Prove the index is really enforced, not just relied upon by the upsert helpers.
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_paired_device("a", &[9_u8; 32]).unwrap();
+        let raw = store.connection.execute(
+            "INSERT INTO devices(id, label, public_key, is_self, paired_at)
+             VALUES ('dup', 'b', ?1, 0, 'now')",
+            params![&[9_u8; 32][..]],
+        );
+        assert!(raw.is_err(), "a duplicate public_key must be rejected");
+        assert_eq!(store.list_devices().unwrap().len(), 1);
     }
 
     #[test]
