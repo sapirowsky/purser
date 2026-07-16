@@ -202,12 +202,14 @@ Not claimed (same honesty the prior docs kept):
   sitting in the agent's own environment, with no record. That default is the actual problem.
 ```
 
-MCP tools exposed to agents (metadata only — no value path exists):
+MCP tools that were planned for agents (metadata only — **CUT 2026-07-15, never shipped**,
+see "Gate C, called early"). Kept here for history only; none of these exist in the product,
+and the metadata-only MCP surface is not built:
 
 ```text
-secret_exists(profile, name) -> boolean
-secret_list(profile)         -> names + configured status
-secret_usage(name)           -> declared references in the project
+secret_exists(profile, name) -> boolean                        (CUT — not built)
+secret_list(profile)         -> names + configured status      (CUT — not built)
+secret_usage(name)           -> declared references in the project   (CUT — not built)
 ```
 
 ## Commands
@@ -295,30 +297,34 @@ CONSEQUENCE — the remaining product is one sentence:
   Week 3 is now the ONLY thing between here and done.
 ```
 
-### Sync scope, narrowed again (2026-07-15)
+### Sync scope (Week 3, as shipped)
 
-Week 3 replicates **secrets only**. The project manifest stays device-local and is NOT synced.
+> SUPERSEDES the 2026-07-15 "secrets only" narrowing. That was the plan when this section
+> was first written; Week 3d then shipped project-manifest replication as well. Week 3
+> replicates **secrets AND the project manifest**. What stays device-local is each project's
+> `local_path` — not the manifest itself.
 
 ```text
-WHY: `projects.local_path` is an absolute path — `C:\Users\<user>\Desktop\purser` on Windows,
-     `/Users/<user>/Desktop/purser` on macOS. Replicating those rows verbatim would push one
-     machine's paths onto another. Solving that needs either a per-device projects root
-     (forces a flat layout) or a device-local path table with git-remote binding (+1 table,
-     +reconciliation, migration 003).
+WHAT SYNCS: secret ciphertext + versions, and the PORTABLE project fields
+     (id, name, git_remote, branch, package_manager, profile_ref, updated_at). Both ride the
+     same seam-3 transport; the manifest is a fourth-cheap delta on top of secret sync.
 
-     None of that is needed for the owner's stated want: "so I don't have to remember about
-     setting up envs in all my devices." Secrets carry NO paths, so replicating them alone
-     dissolves the whole problem.
+WHAT STAYS DEVICE-LOCAL: `projects.local_path`. It is an absolute path —
+     `C:\Users\<user>\Desktop\purser` on Windows, `/Users/<user>/Desktop/purser` on macOS —
+     so replicating it verbatim would push one machine's layout onto another. Instead each
+     device sets its own `projects-root`, and `up` clones a synced project into that root at
+     a path THIS device chooses. Identity is the opaque id (seam 1); the path is a projection.
 
-     Crucially, the hard part of Week 3 — pairing, iroh transport, vault-key exchange — is
-     IDENTICAL either way. Manifest sync is a small delta to add later, behind the same
-     seam-3 transport, once the transport is proven. Nothing is wasted by deferring it.
+RECONCILIATION: manifest rows reconcile by opaque id — last-writer-wins on `updated_at` with
+     a deterministic tie-breaker on the portable fields, so peers converge. A sync NEVER
+     overwrites a device's own `local_path`. The payload carries no path at all.
 
-COST, accepted: on a new machine you still clone repos and `project add` them by hand, once
-     per device. `up --write-env` then materializes the env. The clone-every-repo half of the
-     original pain stays manual for now — revisit only if it actually bites.
+COST, accepted: on a new machine you still set `projects-root` once and clone happens via
+     `up`; you no longer re-`project add` each repo per device — the manifest carries them.
+     `up --write-env` (or the default injection) then materializes the env.
 
-SCHEMA: no change. `projects` simply never enters the synced set.
+SCHEMA: migration 003 added `projects.updated_at` and a `settings` table (holds
+     `projects-root`). `projects.local_path` is simply excluded from the synced payload.
 ```
 
 ### The plaintext rule, deliberately relaxed
