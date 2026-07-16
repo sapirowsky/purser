@@ -81,6 +81,26 @@ pub fn install_vault_key_if_absent(key: &[u8; KEY_LEN]) -> Result<()> {
     )
 }
 
+/// Remove this scoped device's vault key and device key from the OS keyring. An absent key
+/// is not an error — the goal is that nothing of ours remains afterward.
+///
+/// IRREVERSIBLE: once the vault key is gone, this device's encrypted secrets can never be
+/// decrypted again. Callers must confirm intent before calling.
+pub fn delete_all_keys() -> Result<()> {
+    delete_scoped_key(VAULT_KEY_ACCOUNT)?;
+    delete_scoped_key(DEVICE_KEY_ACCOUNT)?;
+    Ok(())
+}
+
+fn delete_scoped_key(account: &str) -> Result<()> {
+    let account = scoped_account(account, purser_core::device_scope().as_deref());
+    let entry = keyring::Entry::new(SERVICE, &account)?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(VaultError::Keyring(error)),
+    }
+}
+
 /// Qualify a keyring account with the device scope, so a virtual device never shares
 /// the real device's keys.
 fn scoped_account(account: &str, scope: Option<&str>) -> String {

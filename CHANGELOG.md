@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `purser uninstall`: interactively remove this device's data (SQLite database + vault
+  and device keys from the OS keyring), with a keep-or-wipe prompt and a typed-name
+  confirmation before any irreversible deletion. Cargo cannot be hooked, so removing the
+  binary stays `cargo uninstall purser`; this command handles the data it leaves behind.
+
 ## [0.1.0] - 2026-07-16
 
 First sync-capable release: pair your devices and your secrets and project manifest

@@ -67,6 +67,11 @@ enum TopCommand {
     Up(UpArgs),
     /// Print shell wrappers for transparent per-project execution.
     Hook(HookArgs),
+    /// Remove this device's Purser data (database + keyring keys), with confirmation.
+    ///
+    /// Cargo cannot be hooked, so this is separate from removing the binary: it clears the
+    /// data, then tells you to run `cargo uninstall purser` for the binary itself.
+    Uninstall,
     #[command(name = "_in-project", hide = true)]
     InProject,
 }
@@ -282,6 +287,7 @@ fn execute(cli: Cli) -> Result<i32> {
         TopCommand::Status => status(),
         TopCommand::Up(args) => up(args),
         TopCommand::Hook(args) => hook(args),
+        TopCommand::Uninstall => uninstall(),
         TopCommand::InProject => in_project(),
     }
 }
@@ -872,6 +878,91 @@ fn projects_root(args: ProjectsRootArgs) -> Result<i32> {
     store.set_setting(PROJECTS_ROOT_SETTING, value)?;
     println!("Projects root set to {}.", path.display());
     Ok(0)
+}
+
+fn uninstall() -> Result<i32> {
+    let db_path = Store::database_path()?;
+    let has_db = db_path.exists();
+    let has_key = purser_vault::vault_key_exists()?;
+
+    if !has_db && !has_key {
+        println!("Nothing to remove: this device has no Purser data.");
+        println!("To remove the binary itself, run: cargo uninstall purser");
+        return Ok(0);
+    }
+
+    // Summarize what a wipe would destroy, reading before anything is touched. The store is
+    // dropped at the end of this block so the database file is unlocked before deletion —
+    // Windows will not delete a file that still has an open handle.
+    let (secret_count, peer_count, self_label) = if has_db {
+        let store = Store::open()?;
+        let secret_count = store.all_secret_names()?.len();
+        let devices = store.list_devices()?;
+        let peer_count = devices.iter().filter(|device| !device.is_self).count();
+        let self_label = devices
+            .iter()
+            .find(|device| device.is_self)
+            .map(|device| device.label.clone());
+        (secret_count, peer_count, self_label)
+    } else {
+        (0, 0, None)
+    };
+
+    println!("This device has {secret_count} secret(s) and is paired with {peer_count} device(s).");
+    if secret_count > 0 && peer_count == 0 {
+        println!("WARNING: no other device holds these secrets — wiping is PERMANENT loss.");
+    }
+    println!();
+    println!("  [k] Keep my data (remove only the binary, yourself)");
+    println!("  [w] Wipe everything on this device (database + vault key) — IRREVERSIBLE");
+
+    let choice = prompt_line("Choice [k/w]: ")?;
+    let wipe = matches!(choice.trim().to_ascii_lowercase().as_str(), "w" | "wipe");
+    if !wipe {
+        println!("Kept your data. To remove the binary, run: cargo uninstall purser");
+        return Ok(0);
+    }
+
+    // Typed-name confirmation: a stray `w` must never be enough to destroy the vault key.
+    let confirm_token = self_label.as_deref().unwrap_or("wipe");
+    let typed = prompt_line(&format!(
+        "Type this device's name '{confirm_token}' to confirm the wipe: "
+    ))?;
+    if typed.trim() != confirm_token {
+        bail!("names did not match; nothing was removed");
+    }
+
+    if has_db {
+        remove_database_files(&db_path)?;
+    }
+    purser_vault::delete_all_keys()?;
+
+    println!("Wiped this device's Purser data (database + keyring keys).");
+    println!("Now remove the binary: cargo uninstall purser");
+    Ok(0)
+}
+
+/// Delete the SQLite database and any journal/WAL sidecars beside it.
+fn remove_database_files(db_path: &Path) -> Result<()> {
+    fs::remove_file(db_path).with_context(|| format!("could not remove {}", db_path.display()))?;
+    if let (Some(dir), Some(name)) = (db_path.parent(), db_path.file_name().and_then(|n| n.to_str()))
+    {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let _ = fs::remove_file(dir.join(format!("{name}{suffix}"))); // best-effort
+        }
+    }
+    Ok(())
+}
+
+/// Print a prompt and read one line from stdin. Works interactively and when piped.
+fn prompt_line(prompt: &str) -> Result<String> {
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("could not read from stdin")?;
+    Ok(line)
 }
 
 fn status() -> Result<i32> {
@@ -2558,6 +2649,16 @@ mod tests {
                 peer: Some(node_id),
                 command: None,
             }) if node_id == "node-id"
+        ));
+    }
+
+    #[test]
+    fn uninstall_parses_as_a_bare_command() {
+        assert!(matches!(
+            Cli::try_parse_from(["purser", "uninstall"])
+                .unwrap()
+                .command,
+            TopCommand::Uninstall
         ));
     }
 
