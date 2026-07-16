@@ -38,7 +38,7 @@ dirs = "6.0.0"
 hkdf = "0.12.4"
 hmac = "0.12.1"
 iroh = "=1.0.2"
-keyring = { version = "3.6.3", features = ["windows-native"] }
+keyring = { version = "3.6.3", features = ["windows-native", "apple-native"] }
 rand = "0.8.5"
 rpassword = "7.4.0"
 rusqlite = { version = "0.37.0", features = ["bundled"] }
