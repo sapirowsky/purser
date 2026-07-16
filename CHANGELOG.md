@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Device mesh (v1.1 part 1).** Devices now gossip their device list as a fourth synced
+  record type, so any two paired devices learn about every other paired device — no machine
+  has to be a hub. Reconciled by public key (not the row id), the self row is never gossiped
+  into a peer, and records describing yourself are ignored.
+- `purser device forget <name>`: revoke a paired device by label. The revocation is a
+  replicating tombstone (migration `005`) — it spreads on the next sync and is sticky, so a
+  forgotten device stops syncing and is not re-introduced. Documented plainly as bookkeeping,
+  not security: a forgotten device still holds the vault key until you rotate it.
 - `purser uninstall`: interactively remove this device's data (SQLite database + vault
   and device keys from the OS keyring), with a keep-or-wipe prompt and a typed-name
   confirmation before any irreversible deletion. Cargo cannot be hooked, so removing the

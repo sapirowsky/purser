@@ -11,6 +11,7 @@ pub const MIGRATION_002_PROJECT_PATHS: &str = include_str!("../migrations/002_pr
 pub const MIGRATION_003_MANIFEST_SYNC: &str = include_str!("../migrations/003_manifest_sync.sql");
 pub const MIGRATION_004_DEVICE_UNIQUENESS: &str =
     include_str!("../migrations/004_device_uniqueness.sql");
+pub const MIGRATION_005_DEVICE_MESH: &str = include_str!("../migrations/005_device_mesh.sql");
 
 pub fn migrations() -> &'static [(&'static str, &'static str)] {
     &[
@@ -18,6 +19,7 @@ pub fn migrations() -> &'static [(&'static str, &'static str)] {
         ("002_project_paths", MIGRATION_002_PROJECT_PATHS),
         ("003_manifest_sync", MIGRATION_003_MANIFEST_SYNC),
         ("004_device_uniqueness", MIGRATION_004_DEVICE_UNIQUENESS),
+        ("005_device_mesh", MIGRATION_005_DEVICE_MESH),
     ]
 }
 
@@ -110,6 +112,9 @@ pub struct Device {
     pub public_key: Vec<u8>,
     pub is_self: bool,
     pub paired_at: String,
+    /// A replicating tombstone set by `device forget`. A revoked peer is excluded from sync
+    /// authorization and is never dialed, but it still holds the vault key it was given.
+    pub revoked: bool,
 }
 
 pub struct Store {
@@ -662,7 +667,7 @@ impl Store {
 
     pub fn list_devices(&self) -> Result<Vec<Device>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, label, public_key, is_self, paired_at
+            "SELECT id, label, public_key, is_self, paired_at, revoked
              FROM devices ORDER BY is_self DESC, label COLLATE NOCASE, rowid",
         )?;
         let rows = statement.query_map([], device_from_row)?;
@@ -673,7 +678,7 @@ impl Store {
         Ok(self
             .connection
             .query_row(
-                "SELECT id, label, public_key, is_self, paired_at
+                "SELECT id, label, public_key, is_self, paired_at, revoked
                  FROM devices WHERE public_key = ?1 ORDER BY rowid LIMIT 1",
                 [public_key],
                 device_from_row,
@@ -714,6 +719,65 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(id)
+    }
+
+    /// Apply a gossiped device record (device mesh). Reconciles by public key: a new peer is
+    /// inserted, a known peer keeps its LOCAL label but adopts the earliest `paired_at` and a
+    /// sticky `revoked` flag (once revoked, always revoked). The self row is never touched —
+    /// a device seeing its own key echoed back must not overwrite its own opinion of itself.
+    pub fn apply_gossiped_device(
+        &self,
+        label: &str,
+        public_key: &[u8],
+        paired_at: &str,
+        revoked: bool,
+    ) -> Result<()> {
+        let tx = self.connection.unchecked_transaction()?;
+        let existing: Option<(String, bool, String, bool)> = tx
+            .query_row(
+                "SELECT id, is_self, paired_at, revoked FROM devices
+                 WHERE public_key = ?1 ORDER BY rowid LIMIT 1",
+                [public_key],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get(2)?,
+                        row.get::<_, i64>(3)? != 0,
+                    ))
+                },
+            )
+            .optional()?;
+        match existing {
+            // Our own device, echoed back by a peer. Never modify the self row.
+            Some((_, true, _, _)) => {}
+            Some((id, false, existing_paired_at, existing_revoked)) => {
+                let earliest = earlier_timestamp(&existing_paired_at, paired_at);
+                let revoked_flag = i64::from(existing_revoked || revoked);
+                tx.execute(
+                    "UPDATE devices SET paired_at = ?1, revoked = ?2 WHERE id = ?3",
+                    params![earliest, revoked_flag, id],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO devices(id, label, public_key, is_self, paired_at, revoked)
+                     VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+                    params![Id::generate().0, label, public_key, paired_at, i64::from(revoked)],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Mark every non-self peer with this label revoked (`device forget`). Returns how many
+    /// rows changed, so the caller can report "no such device". The self row is never revoked.
+    pub fn revoke_peer_by_label(&self, label: &str) -> Result<usize> {
+        Ok(self.connection.execute(
+            "UPDATE devices SET revoked = 1 WHERE label = ?1 AND is_self = 0",
+            [label],
+        )?)
     }
 
     pub fn open_session(&self, kind: &str, scope: Option<&str>) -> Result<String> {
@@ -829,6 +893,7 @@ fn device_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
         public_key: row.get(2)?,
         is_self: row.get::<_, i64>(3)? != 0,
         paired_at: row.get(4)?,
+        revoked: row.get::<_, i64>(5)? != 0,
     })
 }
 
@@ -893,6 +958,15 @@ pub fn unix_nanos_from_timestamp(timestamp: &str) -> Option<i128> {
         None => head.parse::<i64>().ok()? as i128,
     };
     Some(seconds * 1_000_000_000 + nanos)
+}
+
+/// The earlier of two timestamps by real instant. If either is unparseable, keep `a` (the
+/// local value) rather than risk adopting a corrupt one.
+fn earlier_timestamp(a: &str, b: &str) -> String {
+    match (unix_nanos_from_timestamp(a), unix_nanos_from_timestamp(b)) {
+        (Some(an), Some(bn)) if bn < an => b.to_owned(),
+        _ => a.to_owned(),
+    }
 }
 
 fn is_leap_year(year: i64) -> bool {
@@ -978,7 +1052,8 @@ mod tests {
         assert!(MIGRATION_002_PROJECT_PATHS.contains("ALTER TABLE"));
         assert!(MIGRATION_003_MANIFEST_SYNC.contains("CREATE TABLE settings"));
         assert!(MIGRATION_004_DEVICE_UNIQUENESS.contains("CREATE UNIQUE INDEX"));
-        assert_eq!(migrations().len(), 4);
+        assert!(MIGRATION_005_DEVICE_MESH.contains("revoked"));
+        assert_eq!(migrations().len(), 5);
         assert_eq!(civil_date_from_unix_days(0), (1970, 1, 1));
     }
 

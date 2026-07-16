@@ -1,5 +1,6 @@
 //! Purser command-line interface for the local, single-machine vault.
 
+mod device_sync;
 mod project_sync;
 mod secret_sync;
 
@@ -190,6 +191,16 @@ enum DeviceCommand {
         #[arg(long)]
         join: bool,
     },
+    /// Revoke a paired device by label. The revocation replicates to your other devices.
+    ///
+    /// This stops the device from syncing and gossips a tombstone so it is not re-introduced.
+    /// It is bookkeeping, NOT security on its own: a forgotten device still holds the vault
+    /// key it was given and can read anything it already synced. Reclaiming the vault needs
+    /// key rotation (a separate, real ceremony).
+    ///
+    /// The field is named `name` (not `label`) on purpose: a `label` field would collide with
+    /// the global `--label` id and leak this value into the device's own label.
+    Forget { name: String },
 }
 
 #[derive(Debug, Args)]
@@ -342,7 +353,7 @@ async fn sync_serve(key: iroh::SecretKey) -> Result<()> {
                         let peer = connection.peer_id();
                         let authorized = Store::open()?
                             .find_device_by_public_key(peer.as_bytes())?
-                            .is_some_and(|device| !device.is_self);
+                            .is_some_and(|device| !device.is_self && !device.revoked);
                         if !authorized {
                             connection.refuse();
                             eprintln!("warning: refused unpaired sync peer {peer}; no records sent");
@@ -377,14 +388,39 @@ async fn sync_serve(key: iroh::SecretKey) -> Result<()> {
 
 async fn serve_sync_connection(connection: SyncConnection) -> Result<()> {
     let store = Store::open()?;
-    let mut records = secret_sync::build_records(&store)?;
-    let secret_sent = records.len();
-    let project_records = project_sync::build_records(&store)?;
-    let project_sent = project_records.len();
-    records.extend(project_records);
+    let (records, counts) = build_sync_records(&store)?;
     let incoming = connection.exchange_responder(&records).await?;
-    apply_and_report_sync_records(&Store::open()?, &incoming, secret_sent, project_sent)?;
+    apply_and_report_sync_records(&Store::open()?, &incoming, counts)?;
     Ok(())
+}
+
+/// How many of each record type this device offered, for the sync summary.
+#[derive(Clone, Copy, Default)]
+struct SentCounts {
+    secrets: usize,
+    projects: usize,
+    devices: usize,
+}
+
+/// Build the full outbound record set — secrets, project manifest, and the device list —
+/// tagging how many of each so the summary can report them separately.
+fn build_sync_records(store: &Store) -> Result<(Vec<Record>, SentCounts)> {
+    let mut records = secret_sync::build_records(store)?;
+    let secrets = records.len();
+    let project_records = project_sync::build_records(store)?;
+    let projects = project_records.len();
+    records.extend(project_records);
+    let device_records = device_sync::build_records(store)?;
+    let devices = device_records.len();
+    records.extend(device_records);
+    Ok((
+        records,
+        SentCounts {
+            secrets,
+            projects,
+            devices,
+        },
+    ))
 }
 
 /// A peer that is asleep must cost seconds, not minutes: `up` dials every paired device
@@ -397,9 +433,9 @@ async fn sync_peer(key: iroh::SecretKey, node_id: &str) -> Result<()> {
         .context("NODE_ID must be an iroh public key")?;
     let paired = Store::open()?
         .find_device_by_public_key(peer.as_bytes())?
-        .is_some_and(|device| !device.is_self);
+        .is_some_and(|device| !device.is_self && !device.revoked);
     if !paired {
-        bail!("sync refused: {peer} is not a paired device");
+        bail!("sync refused: {peer} is not a paired (non-revoked) device");
     }
     let endpoint = bind_sync(key).await?;
     let result = sync_one_peer(&endpoint, peer).await;
@@ -416,7 +452,7 @@ async fn sync_all_paired(key: iroh::SecretKey) -> Result<(usize, usize)> {
     let peers: Vec<(iroh::PublicKey, String)> = Store::open()?
         .list_devices()?
         .into_iter()
-        .filter(|device| !device.is_self)
+        .filter(|device| !device.is_self && !device.revoked)
         .map(|device| {
             let key = iroh::PublicKey::try_from(device.public_key.as_slice())
                 .context("a stored device has an invalid iroh public key")?;
@@ -448,15 +484,10 @@ async fn sync_all_paired(key: iroh::SecretKey) -> Result<(usize, usize)> {
 }
 
 async fn sync_one_peer(endpoint: &iroh::Endpoint, peer: iroh::PublicKey) -> Result<()> {
-    let store = Store::open()?;
-    let mut records = secret_sync::build_records(&store)?;
-    let secret_sent = records.len();
-    let project_records = project_sync::build_records(&store)?;
-    let project_sent = project_records.len();
-    records.extend(project_records);
+    let (records, counts) = build_sync_records(&Store::open()?)?;
     let connection = connect_sync(endpoint, peer).await?;
     let incoming = connection.exchange_initiator(&records).await?;
-    apply_and_report_sync_records(&Store::open()?, &incoming, secret_sent, project_sent)
+    apply_and_report_sync_records(&Store::open()?, &incoming, counts)
 }
 
 /// Enough of a NodeId to recognize, not so much that it wraps the line.
@@ -474,23 +505,32 @@ fn report_sync_summary(summary: &secret_sync::SyncSummary) {
 fn apply_and_report_sync_records(
     store: &Store,
     incoming: &[Record],
-    secret_sent: usize,
-    project_sent: usize,
+    sent: SentCounts,
 ) -> Result<()> {
-    let (projects, secrets): (Vec<_>, Vec<_>) = incoming
+    let (devices, rest): (Vec<_>, Vec<_>) = incoming
         .iter()
         .cloned()
-        .partition(project_sync::is_project_record);
+        .partition(device_sync::is_device_record);
+    let (projects, secrets): (Vec<_>, Vec<_>) =
+        rest.into_iter().partition(project_sync::is_project_record);
+
     let mut secret_summary = secret_sync::apply_records(store, &secrets)?;
-    secret_summary.sent = secret_sent;
+    secret_summary.sent = sent.secrets;
     report_sync_summary(&secret_summary);
 
     let mut project_summary = project_sync::apply_records(store, &projects)?;
-    project_summary.sent = project_sent;
+    project_summary.sent = sent.projects;
     for warning in &project_summary.warnings {
         eprintln!("warning: {warning}");
     }
     println!("{}", project_summary.render());
+
+    let mut device_summary = device_sync::apply_records(store, &devices)?;
+    device_summary.sent = sent.devices;
+    for warning in &device_summary.warnings {
+        eprintln!("warning: {warning}");
+    }
+    println!("{}", device_summary.render());
     Ok(())
 }
 
@@ -518,7 +558,13 @@ async fn device_async(args: DeviceArgs) -> Result<i32> {
             for device in Store::open()?.list_devices()? {
                 let node_id = iroh::PublicKey::try_from(device.public_key.as_slice())
                     .context("a stored device has an invalid iroh public key")?;
-                let marker = if device.is_self { " (self)" } else { "" };
+                let marker = if device.is_self {
+                    " (self)"
+                } else if device.revoked {
+                    " (revoked)"
+                } else {
+                    ""
+                };
                 println!("{}  {}{}", node_id, device.label, marker);
             }
         }
@@ -530,6 +576,18 @@ async fn device_async(args: DeviceArgs) -> Result<i32> {
             } else {
                 device_pair_serve(identity).await?
             }
+        }
+        DeviceCommand::Forget { name } => {
+            let revoked = Store::open()?.revoke_peer_by_label(&name)?;
+            if revoked == 0 {
+                bail!("no paired device is labelled {name:?}");
+            }
+            println!("Revoked {revoked} device(s) labelled {name:?}.");
+            println!("Run `purser sync` to spread this to your other devices.");
+            println!(
+                "Note: this is bookkeeping. {name:?} still holds the vault key and can read \
+                 what it already synced — rotate the vault key to truly lock it out."
+            );
         }
     }
     Ok(0)
@@ -2650,6 +2708,23 @@ mod tests {
                 command: None,
             }) if node_id == "node-id"
         ));
+    }
+
+    #[test]
+    fn forget_target_does_not_leak_into_the_global_label() {
+        // Regression: a `label` field on Forget collided with the global `--label` id, so
+        // `device forget X` renamed the device itself. The field is now `name`.
+        let parsed = Cli::try_parse_from(["purser", "device", "forget", "laptop"]).unwrap();
+        match parsed.command {
+            TopCommand::Device(DeviceArgs {
+                label,
+                command: DeviceCommand::Forget { name },
+            }) => {
+                assert_eq!(name, "laptop");
+                assert_eq!(label, None, "forget target must not set the device --label");
+            }
+            _ => panic!("device forget parsed as the wrong command"),
+        }
     }
 
     #[test]
