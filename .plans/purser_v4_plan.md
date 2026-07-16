@@ -1,16 +1,22 @@
 ---
-title: "Purser v1 — One-Command Dev Sync with Agent-Blind Secrets"
-version: "4.1"
+title: "Purser v1 — One-Command Dev Sync"
+version: "4.2"
 status: "active"
 created: "2026-07-14"
+updated: "2026-07-15"
 supersedes: "agent_capability_broker_v4.md (v4.0), devsync_v1_plan.md, objectos_agent_workspace_plan_v2.md"
 scope_locked_by_owner:
   - "Sync scope: bootstrap + secrets. NO live working-tree sync. Git carries committed code."
   - "Transport: peer-to-peer between the owner's own devices. No hosted server."
-one_line: "One command sets up any of my machines — clone every repo, rehydrate deps, inject env — and secret values sync peer-to-peer between my devices while staying invisible to AI agents."
+  - "2026-07-15 — Gate C called EARLY: the agent-blind half is CUT. See 'Gate C, called early'."
+one_line: "One command sets up any of my machines — clone every repo, rehydrate deps, and have my env already there — with secret values syncing peer-to-peer between my devices, encrypted at rest and on the wire."
 ---
 
-# Purser v1 — One-Command Dev Sync with Agent-Blind Secrets
+# Purser v1 — One-Command Dev Sync
+
+> **2026-07-15 — the agent-blind half is cut.** This document still describes it below,
+> because the code exists and works. It is no longer a reason this project exists.
+> Read "Gate C, called early" before acting on any section that mentions agents.
 
 ## The actual problem (owner's words)
 
@@ -31,7 +37,8 @@ Two commands cover the entire pain:
 purser up                 # on any machine: reproduce my whole dev environment
   → clones every project from its git remote
   → rehydrates dependencies (npm/pnpm/cargo/uv install per project)
-  → injects env from the encrypted vault — NO plaintext .env written to disk
+  → injects env from the encrypted vault (default). Plaintext .env is written only
+    with the opt-in `up --write-env` — see "The plaintext rule, deliberately relaxed".
 
 purser agent -- claude    # run an agent that can work, but can't see secrets
   → agent launched with ZERO secret variables in its environment
@@ -176,7 +183,9 @@ Guarantees:
 
 ```text
 - Secret values are never written to the audit log, never returned by any MCP tool,
-  never placed in the agent's own environment, and never written to disk as plaintext.
+  and never placed in the agent's own environment. They are not written to disk as
+  plaintext by default; the sole exception is the opt-in `up --write-env` (see "The
+  plaintext rule, deliberately relaxed"), which still keeps values off stdout and the audit log.
 - Values are decrypted only in memory and injected only into a specific approved child
   process, then dropped.
 - On import, the source .env is removed (with warnings until every plaintext copy is gone).
@@ -193,12 +202,14 @@ Not claimed (same honesty the prior docs kept):
   sitting in the agent's own environment, with no record. That default is the actual problem.
 ```
 
-MCP tools exposed to agents (metadata only — no value path exists):
+MCP tools that were planned for agents (metadata only — **CUT 2026-07-15, never shipped**,
+see "Gate C, called early"). Kept here for history only; none of these exist in the product,
+and the metadata-only MCP surface is not built:
 
 ```text
-secret_exists(profile, name) -> boolean
-secret_list(profile)         -> names + configured status
-secret_usage(name)           -> declared references in the project
+secret_exists(profile, name) -> boolean                        (CUT — not built)
+secret_list(profile)         -> names + configured status      (CUT — not built)
+secret_usage(name)           -> declared references in the project   (CUT — not built)
 ```
 
 ## Commands
@@ -248,6 +259,90 @@ Week 4  Third system (WSL) + hardening + the gate.
         WSL keyring fallback, cross-platform pass, audit tamper-check, honest-limits
         README. Run all 3 of your systems off Purser for a week.
         → Gate: do you stop doing the manual clone/env dance? If yes, it's real.
+        REVISED 2026-07-15: the MCP metadata tools originally scheduled here are CUT.
+        What remains is WSL + cross-platform hardening + the gate.
+```
+
+## Gate C, called early (2026-07-15)
+
+Gate C said: *"Fail: find which half (sync / agent-blind secrets) you actually kept using,
+and cut the other."* After running Week 1 + Week 2 + the hook end-to-end on Windows, the
+owner called it in twenty minutes rather than four weeks:
+
+> "i dont see myself using this keyvault to hide values from agents especially that it
+> doesn't really hide it because agent is always one command away from showing it. i will
+> use it just with purser import when we have syncing so i don't have to remember about
+> setting up envs in all my devices"
+
+**The critique is correct, and this document already conceded it** (see "Not claimed"):
+`purser run -- node -e "console.log(process.env.X)"` prints the value. Value-blindness was
+only ever *audited, not contained*. Containment is ladder rung 2, and nobody built it.
+
+```text
+CUT — do not build, do not invest further:
+  - MCP metadata tools (secret_exists / secret_list / secret_usage).   Week 4 item. Dead.
+  - Any further work on `purser agent --`.  It stays in the binary because it already works
+    and costs nothing to keep, but it is no longer a reason this product exists.
+  - The "invisible to AI agents" claim, in the one_line and in any README.
+  - Gate C's second clause ("you let agents near real credentials"). Deleted below.
+
+KEPT — and note WHY, because it is not the obvious reason:
+  - The vault. Encryption at rest is the SYNC SUBSTRATE, not the agent feature. Secret
+    values cannot replicate between devices without it. Cutting agent-blindness does not
+    touch the vault.
+  - import / secrets / run / shell / hook / up / manifest / audit. All still earn their keep.
+
+CONSEQUENCE — the remaining product is one sentence:
+  bootstrap a machine (`up`) + have my env already there, synced (Week 3).
+  Week 3 is now the ONLY thing between here and done.
+```
+
+### Sync scope (Week 3, as shipped)
+
+> SUPERSEDES the 2026-07-15 "secrets only" narrowing. That was the plan when this section
+> was first written; Week 3d then shipped project-manifest replication as well. Week 3
+> replicates **secrets AND the project manifest**. What stays device-local is each project's
+> `local_path` — not the manifest itself.
+
+```text
+WHAT SYNCS: secret ciphertext + versions, and the PORTABLE project fields
+     (id, name, git_remote, branch, package_manager, profile_ref, updated_at). Both ride the
+     same seam-3 transport; the manifest is a fourth-cheap delta on top of secret sync.
+
+WHAT STAYS DEVICE-LOCAL: `projects.local_path`. It is an absolute path —
+     `C:\Users\<user>\Desktop\purser` on Windows, `/Users/<user>/Desktop/purser` on macOS —
+     so replicating it verbatim would push one machine's layout onto another. Instead each
+     device sets its own `projects-root`, and `up` clones a synced project into that root at
+     a path THIS device chooses. Identity is the opaque id (seam 1); the path is a projection.
+
+RECONCILIATION: manifest rows reconcile by opaque id — last-writer-wins on `updated_at` with
+     a deterministic tie-breaker on the portable fields, so peers converge. A sync NEVER
+     overwrites a device's own `local_path`. The payload carries no path at all.
+
+COST, accepted: on a new machine you still set `projects-root` once and clone happens via
+     `up`; you no longer re-`project add` each repo per device — the manifest carries them.
+     `up --write-env` (or the default injection) then materializes the env.
+
+SCHEMA: migration 003 added `projects.updated_at` and a `settings` table (holds
+     `projects-root`). `projects.local_path` is simply excluded from the synced payload.
+```
+
+### The plaintext rule, deliberately relaxed
+
+This plan guaranteed *"no plaintext .env is ever written."* That guarantee existed to keep
+values away from agents. With that goal cut, the owner chose to trade it for ergonomics:
+
+```text
+`purser up --write-env`  materializes a real .env from the vault on a fresh machine.
+  Opt-in, never default. Injection via `run`/`hook` remains the default path.
+  Rationale: tools that PARSE .env directly (Prisma, Docker Compose) work with no hook,
+  and no ~32ms-per-command wrapper tax.
+  Safety rails that do NOT bend:
+    - `.env` is added to .gitignore BEFORE the file is created.
+    - An existing .env is NEVER overwritten (it may hold values never imported).
+    - 0600 on Unix. Buffers zeroized. Values still never reach stdout or the audit log.
+  The vault stays the source of truth; the .env is a per-machine PROJECTION of it
+  (consistent with seam 1: identity is the ULID, the file is a projection).
 ```
 
 ## Gates — kill / pivot (deadlines, not vision)
@@ -261,20 +356,28 @@ Gate B — end of week 2
   You reproduce a machine's projects with one `purser up` and don't touch a .env by hand.
   Fail: the manifest/rehydrate step is more fiddly than doing it manually — simplify it.
 
-Gate C — end of week 4 (the real test)
-  All 3 of your systems run off Purser for one week. Pass: you no longer manually clone
-  repos or re-add env when switching machines, and you let agents near real credentials
-  because you can prove what they touched. Fail: find which half (sync / agent-blind
-  secrets) you actually kept using, and cut the other.
+Gate C — CALLED 2026-07-15, ahead of schedule. See "Gate C, called early" above.
+  Outcome: the agent-blind half is cut; sync is the half that survives.
+  The clause about letting agents near real credentials is DELETED — the owner does not
+  want it and the guarantee was never strong enough to earn it.
+  What remains to prove (Gate C'):
+    All 3 systems run off Purser for one week. Pass: you no longer manually clone repos or
+    re-add env when switching machines. Fail: sync is more fiddly than the manual dance —
+    in which case the honest answer is that Purser is a local vault plus `up`, and that is
+    a fine place to stop.
 ```
 
 ## Test plan and acceptance
 
 ```text
-- Values never appear in: audit log, MCP responses, agent environment, disk, sync logs.
+- Values never appear in: audit log, MCP responses, agent environment, sync logs.
+  (DISK is no longer on this list — `up --write-env` is an owner-approved exception.
+   Everything else still holds: a value reaching the audit log or a sync log is a bug.)
 - Import encrypts values and removes plaintext .env (warns until it's gone).
+- `up --write-env` writes .env ONLY where none exists, gitignores it BEFORE creating it,
+  and round-trips through Purser's own parser without corrupting any value.
 - run/shell inject only in memory; parent environment unchanged afterward.
-- `agent --` starts a child with zero secret variables.
+- `agent --` starts a child with zero secret variables.   (kept, no longer a headline)
 - `purser up` on a clean machine clones all repos, installs deps, and injects env.
 - node_modules / target / build dirs are never transmitted between devices.
 - Pairing transfers the vault key only over an authenticated channel; an unpaired device
@@ -284,13 +387,12 @@ Gate C — end of week 4 (the real test)
 - Audit log tampering is detectable (append-only + checksum chain).
 ```
 
-Private-v1 success:
+Private-v1 success (revised 2026-07-15 — the agent clause is cut):
 
 ```text
 - The owner runs all 3 systems off Purser daily for two weeks.
-- The manual clone-and-env dance stops happening.
-- An agent runs on a project with real credentials and the receipt is trusted.
-- Zero incidents of a value reaching disk, the audit log, or an agent's model context.
+- The manual clone-and-env dance stops happening.          ← the ONLY test that matters now
+- Zero incidents of a value reaching the audit log or a sync log.
 ```
 
 ## Assumptions
