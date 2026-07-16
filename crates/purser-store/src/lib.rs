@@ -1113,6 +1113,66 @@ mod tests {
     }
 
     #[test]
+    fn migration_004_reconciles_historical_duplicate_devices() {
+        // A database written by an older build (no transactional upsert guards) can hold two
+        // self rows, a legacy nonzero is_self, and a duplicated peer key. The migration must
+        // reconcile all three so the unique indexes can be created without failing.
+        let path = std::env::temp_dir().join(format!("purser-{}.db", Id::generate()));
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                     name TEXT PRIMARY KEY,
+                     applied_at TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        connection.execute_batch(MIGRATION_001_INIT).unwrap();
+        connection
+            .execute(
+                "INSERT INTO schema_migrations(name, applied_at) VALUES ('001_init', 'now')",
+                [],
+            )
+            .unwrap();
+        // selfA (is_self=1) and selfB (legacy is_self=2) are both "self"; peer + peer-dup
+        // share one public key.
+        for (id, label, key, is_self) in [
+            ("s1", "selfA", [0xAA_u8; 32], 1_i64),
+            ("s2", "selfB", [0xBB_u8; 32], 2),
+            ("p1", "peer", [0xCC_u8; 32], 0),
+            ("p2", "peer-dup", [0xCC_u8; 32], 0),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO devices(id, label, public_key, is_self, paired_at)
+                     VALUES (?1, ?2, ?3, ?4, 'now')",
+                    params![id, label, &key[..], is_self],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let store = Store::open_at(&path).unwrap();
+        let devices = store.list_devices().unwrap();
+
+        // The duplicate peer collapsed to one, so three devices remain.
+        assert_eq!(devices.len(), 3);
+        // Exactly one self row, and it is the deterministic survivor (selfA).
+        let selves: Vec<_> = devices.iter().filter(|d| d.is_self).collect();
+        assert_eq!(selves.len(), 1);
+        assert_eq!(selves[0].label, "selfA");
+        // Every public key is now unique.
+        let mut keys: Vec<_> = devices.iter().map(|d| d.public_key.clone()).collect();
+        keys.sort();
+        let unique = keys.len();
+        keys.dedup();
+        assert_eq!(keys.len(), unique, "public keys must be unique after migration");
+
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn project_upsert_updates_existing_path() {
         let store = Store::open_in_memory().unwrap();
         let first_id = store
