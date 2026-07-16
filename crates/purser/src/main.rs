@@ -176,8 +176,15 @@ enum DeviceCommand {
     Listen,
     /// Dial a NodeId and measure an unauthenticated hello round-trip.
     Connect { node_id: String },
-    /// Show a one-time enrollment code, or use one to enroll this device.
-    Pair { code: Option<String> },
+    /// Show a one-time enrollment code, or with `--join` enroll this device by entering one.
+    ///
+    /// The code is never taken as an argument: it grants the vault key, and an argument
+    /// lingers in shell history and is briefly visible in the process list. `--join` reads
+    /// it from a hidden prompt (or stdin when piped).
+    Pair {
+        #[arg(long)]
+        join: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -511,10 +518,13 @@ async fn device_async(args: DeviceArgs) -> Result<i32> {
         }
         DeviceCommand::Listen => device_listen(identity.key).await?,
         DeviceCommand::Connect { node_id } => device_connect(identity.key, &node_id).await?,
-        DeviceCommand::Pair { code } => match code {
-            Some(code) => device_pair_join(identity, code).await?,
-            None => device_pair_serve(identity).await?,
-        },
+        DeviceCommand::Pair { join } => {
+            if join {
+                device_pair_join(identity, read_pairing_code()?).await?
+            } else {
+                device_pair_serve(identity).await?
+            }
+        }
     }
     Ok(0)
 }
@@ -616,7 +626,40 @@ async fn device_connect(key: iroh::SecretKey, node_id: &str) -> Result<()> {
 
 const PAIRING_WINDOW: Duration = Duration::from_secs(10 * 60);
 
+/// Read the one-time pairing code without ever placing it in argv, where it would linger in
+/// shell history and be briefly visible in the process list. Hidden prompt when interactive;
+/// a plain stdin line when piped, so scripted enrollment still works.
+fn read_pairing_code() -> Result<String> {
+    use std::io::IsTerminal;
+    let raw = if std::io::stdin().is_terminal() {
+        rpassword::prompt_password("Pairing code: ").context("could not read the pairing code")?
+    } else {
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("could not read the pairing code from stdin")?;
+        line
+    };
+    let code = raw.trim().to_owned();
+    if code.is_empty() {
+        bail!("no pairing code was entered");
+    }
+    Ok(code)
+}
+
 async fn device_pair_serve(identity: DeviceIdentity) -> Result<()> {
+    // This device gives its vault key away during pairing, so it must already hold one.
+    // Check before opening the window: otherwise the joiner authenticates and does real
+    // work only to fail in the authorized closure with VaultKeyMissing. Fail-fast here
+    // rather than minting a key, so a fresh device that meant to JOIN (and should have run
+    // `pair <CODE>`) is told what it did instead of silently becoming its own vault.
+    if !purser_vault::vault_key_exists()? {
+        bail!(
+            "this device has no vault key to share yet. Import a secret first \
+             (e.g. `purser import .env --profile local`), or to join another device's vault \
+             run `purser device pair <CODE>` with the code shown on that device."
+        );
+    }
     let endpoint = bind_pairing(identity.key).await?;
     if tokio::time::timeout(Duration::from_secs(15), endpoint.online())
         .await
@@ -874,21 +917,24 @@ fn status() -> Result<i32> {
 /// of them awake, the local manifest is still worth acting on. Only the networking runtime
 /// is paid for, and only when a sync is actually attempted.
 fn sync_before_up() -> Result<()> {
+    // Every step here is best-effort: a missing device identity, a runtime that will not
+    // build, or an unreachable peer must all degrade to "use local state", never abort `up`.
+    if let Err(error) = try_sync_before_up() {
+        eprintln!("warning: skipping sync: {error:#}");
+        eprintln!("warning: continuing with this device's own manifest.");
+    }
+    println!();
+    Ok(())
+}
+
+fn try_sync_before_up() -> Result<()> {
     let identity = ensure_device_identity(None)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("could not start the sync networking runtime")?;
-    match runtime.block_on(sync_all_paired(identity.key)) {
-        Ok((reached, unreachable)) => {
-            println!("Synced with {reached} device(s); {unreachable} unreachable.");
-        }
-        Err(error) => {
-            eprintln!("warning: skipping sync: {error:#}");
-            eprintln!("warning: continuing with this device's own manifest.");
-        }
-    }
-    println!();
+    let (reached, unreachable) = runtime.block_on(sync_all_paired(identity.key))?;
+    println!("Synced with {reached} device(s); {unreachable} unreachable.");
     Ok(())
 }
 
@@ -1138,35 +1184,61 @@ fn materialize_project_dotenv(
         contents.push_str(&line);
     }
 
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = match options.open(&dotenv_path) {
-        Ok(file) => file,
-        // `create_new` is what actually enforces "never overwrite": the earlier exists()
-        // check is only for reporting, and something may have created the file since.
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Ok(DotenvMaterialization::Skipped(
-                "one appeared while purser was running",
-            ));
+    // Materialize through a hardened temp file, then hard-link it into place. This makes the
+    // .env appear complete or not at all: a failed or interrupted write can never leave a
+    // half-populated file holding SOME of the secrets. The link (not a rename) fails rather
+    // than overwrites if a .env appeared meanwhile, preserving the never-overwrite rule.
+    let temp_path = directory.join(format!(".env.purser-{}.tmp", std::process::id()));
+    let _ = fs::remove_file(&temp_path); // clear any stale temp from a crashed prior run
+
+    let outcome = (|| -> Result<bool> {
+        write_hardened_file(&temp_path, contents.as_bytes())?;
+        // Audit BEFORE committing: the append-only record must exist before a secret becomes
+        // readable on disk, never after. (If the link below loses the never-overwrite race,
+        // this over-reports by one — an accepted, fail-closed trade versus writing silently.)
+        for (name, _) in &plaintexts {
+            store.append_audit_event(None, "env_written", Some(name), "used")?;
         }
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("could not create {}", dotenv_path.display()));
+        match fs::hard_link(&temp_path, &dotenv_path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(anyhow::Error::new(error))
+                .with_context(|| format!("could not install {}", dotenv_path.display())),
         }
-    };
-    file.write_all(contents.as_bytes())
-        .with_context(|| format!("could not write {}", dotenv_path.display()))?;
+    })();
+
     contents.zeroize();
     for (_, plaintext) in &mut plaintexts {
         plaintext.zeroize();
     }
-    for (name, _) in &plaintexts {
-        store.append_audit_event(None, "env_written", Some(name), "used")?;
-    }
+    // Remove the temp copy on every path: on success the linked .env keeps the content; on
+    // failure or a lost race this leaves no hardened plaintext artifact behind.
+    let _ = fs::remove_file(&temp_path);
 
-    Ok(DotenvMaterialization::Written(plaintexts.len()))
+    if outcome? {
+        Ok(DotenvMaterialization::Written(plaintexts.len()))
+    } else {
+        Ok(DotenvMaterialization::Skipped(
+            "one appeared while purser was running",
+        ))
+    }
+}
+
+/// Create `path` fresh (never overwriting), 0600 on Unix, write `contents`, and flush it to
+/// disk. Used to stage a dotenv before atomically linking it into place.
+fn write_hardened_file(path: &Path, contents: &[u8]) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("could not create {}", path.display()))?;
+    file.write_all(contents)
+        .with_context(|| format!("could not write {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("could not flush {}", path.display()))?;
+    Ok(())
 }
 
 /// Clone and rehydrate one project, returning a description of each action taken.
@@ -2444,14 +2516,28 @@ mod tests {
             }) if node_id == "node-id"
         ));
 
-        let pair = Cli::try_parse_from(["purser", "device", "pair", "opaque-code"]).unwrap();
+        // Hosting takes no secret; joining is a flag, never a positional, so the code
+        // cannot arrive through argv.
+        let host = Cli::try_parse_from(["purser", "device", "pair"]).unwrap();
         assert!(matches!(
-            pair.command,
+            host.command,
             TopCommand::Device(DeviceArgs {
                 label: None,
-                command: DeviceCommand::Pair { code: Some(code) },
-            }) if code == "opaque-code"
+                command: DeviceCommand::Pair { join: false },
+            })
         ));
+
+        let join = Cli::try_parse_from(["purser", "device", "pair", "--join"]).unwrap();
+        assert!(matches!(
+            join.command,
+            TopCommand::Device(DeviceArgs {
+                command: DeviceCommand::Pair { join: true },
+                ..
+            })
+        ));
+
+        // A stray positional (an old-style code argument) must now be rejected.
+        assert!(Cli::try_parse_from(["purser", "device", "pair", "opaque-code"]).is_err());
     }
 
     #[test]

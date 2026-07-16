@@ -37,7 +37,8 @@ Two commands cover the entire pain:
 purser up                 # on any machine: reproduce my whole dev environment
   → clones every project from its git remote
   → rehydrates dependencies (npm/pnpm/cargo/uv install per project)
-  → injects env from the encrypted vault — NO plaintext .env written to disk
+  → injects env from the encrypted vault (default). Plaintext .env is written only
+    with the opt-in `up --write-env` — see "The plaintext rule, deliberately relaxed".
 
 purser agent -- claude    # run an agent that can work, but can't see secrets
   → agent launched with ZERO secret variables in its environment
@@ -182,7 +183,9 @@ Guarantees:
 
 ```text
 - Secret values are never written to the audit log, never returned by any MCP tool,
-  never placed in the agent's own environment, and never written to disk as plaintext.
+  and never placed in the agent's own environment. They are not written to disk as
+  plaintext by default; the sole exception is the opt-in `up --write-env` (see "The
+  plaintext rule, deliberately relaxed"), which still keeps values off stdout and the audit log.
 - Values are decrypted only in memory and injected only into a specific approved child
   process, then dropped.
 - On import, the source .env is removed (with warnings until every plaintext copy is gone).
@@ -297,8 +300,8 @@ CONSEQUENCE — the remaining product is one sentence:
 Week 3 replicates **secrets only**. The project manifest stays device-local and is NOT synced.
 
 ```text
-WHY: `projects.local_path` is an absolute path — `C:\Users\sapir\Desktop\purser` on Windows,
-     `/Users/sapir/Desktop/purser` on macOS. Replicating those rows verbatim would push one
+WHY: `projects.local_path` is an absolute path — `C:\Users\<user>\Desktop\purser` on Windows,
+     `/Users/<user>/Desktop/purser` on macOS. Replicating those rows verbatim would push one
      machine's paths onto another. Solving that needs either a per-device projects root
      (forces a flat layout) or a device-local path table with git-remote binding (+1 table,
      +reconciliation, migration 003).

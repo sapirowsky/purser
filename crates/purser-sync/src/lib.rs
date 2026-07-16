@@ -12,6 +12,7 @@ use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
 use rand::{rngs::OsRng, RngCore};
 use sha2::Sha256;
 use std::future::Future;
+use std::time::Duration;
 use zeroize::{Zeroize, Zeroizing};
 
 const ALPN: &[u8] = b"purser/transport/1";
@@ -25,6 +26,10 @@ const AEAD_TAG_BYTES: usize = 16;
 const MAX_LABEL_BYTES: usize = 1024;
 const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RECORDS_PER_EXCHANGE: usize = 1_000_000;
+/// How long to wait for a peer to acknowledge (consume) a finished stream before returning
+/// anyway. The wait exists only to avoid closing a record away on fast local connections; a
+/// peer that never reads must not be able to hang the sender indefinitely.
+const STREAM_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A decoded one-time pairing code. Its secret bytes are scrubbed on drop and it
 /// deliberately has no `Debug` implementation.
@@ -174,8 +179,8 @@ impl Transport for IrohTransport {
         // up as soon as it has what it needs is ending the exchange normally, not failing
         // it, and a peer that never reads is detected by that peer, not by us. Confirming
         // a record is durably stored is the replication protocol's job (3c), not the
-        // transport's.
-        let _ = stream.stopped().await;
+        // transport's. Bounded so an unresponsive peer cannot hang the sender forever.
+        let _ = tokio::time::timeout(STREAM_ACK_TIMEOUT, stream.stopped()).await;
         Ok(())
     }
 
@@ -295,7 +300,8 @@ async fn write_batch(send: &mut iroh::endpoint::SendStream, records: &[Record]) 
     // The exchange owner may drop its connection immediately after both halves finish.
     // Do not return until the peer has consumed this stream, or queued records can be
     // closed away on fast local connections (the same lifetime rule as `Transport::send`).
-    let _ = send.stopped().await;
+    // Bounded for the same reason: a peer that never reads must not stall the exchange.
+    let _ = tokio::time::timeout(STREAM_ACK_TIMEOUT, send.stopped()).await;
     Ok(())
 }
 

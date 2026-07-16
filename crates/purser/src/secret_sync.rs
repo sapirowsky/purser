@@ -178,7 +178,13 @@ where
                 "CONFLICT: concurrent edits to secret {} version {}; last writer wins",
                 payload.name, payload.version
             ));
-            if order.is_gt() {
+            // Equal instants must not diverge: without a tie-breaker each peer would keep its
+            // own value and the mesh would never converge. Break the tie on the value bytes,
+            // which both devices hold, so every peer independently picks the same winner.
+            let incoming_wins = order
+                .then_with(|| payload.value[..].cmp(&local_value[..]))
+                .is_gt();
+            if incoming_wins {
                 let ciphertext = encrypt_at_rest(&payload.value[..])
                     .context("could not encrypt a received value for local storage")?;
                 store.replace_synced_secret_version(
@@ -539,6 +545,29 @@ mod tests {
             b"local-kept"[..]
         );
         assert!(summary.warnings[0].contains("cannot be ordered"));
+    }
+
+    #[test]
+    fn equal_timestamps_converge_on_the_same_winner_on_both_peers() {
+        // Two devices edit the same version at the SAME instant with different values. Without
+        // a deterministic tie-breaker each peer keeps its own value and the mesh never
+        // converges. Both must independently choose the same winner (the larger value bytes).
+        let ts = "2026-07-15T10:00:00.000000000Z";
+        let a = Store::open_in_memory().unwrap();
+        let b = Store::open_in_memory().unwrap();
+        insert_version(&a, "01SHARED", "TOKEN", "test", 1, b"aaa", ts);
+        insert_version(&b, "01SHARED", "TOKEN", "test", 1, b"bbb", ts);
+
+        // Build each peer's records from its pre-sync state, then apply to the other.
+        let for_a = build_records_with(&b, open, seal).unwrap();
+        let for_b = build_records_with(&a, open, seal).unwrap();
+        apply_records_with(&a, &for_a, open, seal).unwrap();
+        apply_records_with(&b, &for_b, open, seal).unwrap();
+
+        let a_val = open(&a.all_secret_versions_for_sync().unwrap()[0].ciphertext).unwrap();
+        let b_val = open(&b.all_secret_versions_for_sync().unwrap()[0].ciphertext).unwrap();
+        assert_eq!(a_val[..], b_val[..], "peers must converge on one value");
+        assert_eq!(&a_val[..], b"bbb", "the larger value bytes win deterministically");
     }
 
     #[test]

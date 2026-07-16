@@ -114,14 +114,24 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open the per-user production database and apply pending migrations.
-    pub fn open() -> Result<Self> {
-        let base = dirs::data_local_dir().ok_or(StoreError::NoDataDirectory)?;
-        let mut directory = base.join("purser");
-        // A scoped device keeps its own database, alongside its own keyring accounts.
+    /// The data directory for the device in effect. A scoped device (`PURSER_DEVICE`) keeps
+    /// its own directory, alongside its own keyring accounts; the real device uses the root.
+    ///
+    /// One builder feeds both [`Self::open`] and [`Self::database_path`] so a scoped device
+    /// can never open one database while reporting another.
+    fn scoped_data_dir() -> Result<PathBuf> {
+        let mut directory = dirs::data_local_dir()
+            .ok_or(StoreError::NoDataDirectory)?
+            .join("purser");
         if let Some(scope) = purser_core::device_scope() {
             directory = directory.join("devices").join(scope);
         }
+        Ok(directory)
+    }
+
+    /// Open the per-user production database and apply pending migrations.
+    pub fn open() -> Result<Self> {
+        let directory = Self::scoped_data_dir()?;
         std::fs::create_dir_all(&directory).map_err(StoreError::CreateDataDirectory)?;
         Self::open_at(directory.join("purser.db"))
     }
@@ -142,10 +152,7 @@ impl Store {
     }
 
     pub fn database_path() -> Result<PathBuf> {
-        Ok(dirs::data_local_dir()
-            .ok_or(StoreError::NoDataDirectory)?
-            .join("purser")
-            .join("purser.db"))
+        Ok(Self::scoped_data_dir()?.join("purser.db"))
     }
 
     fn initialize(&mut self) -> Result<()> {
@@ -610,16 +617,17 @@ impl Store {
 
     /// Record this installation's identity, preserving exactly one self row.
     pub fn upsert_self_device(&self, label: &str, public_key: &[u8]) -> Result<String> {
-        let existing_self: Option<String> = self
-            .connection
+        // Read-then-write across three statements: run them in one transaction so a crash or
+        // a concurrent process can never leave two self rows or a self row without its key.
+        let tx = self.connection.unchecked_transaction()?;
+        let existing_self: Option<String> = tx
             .query_row(
                 "SELECT id FROM devices WHERE is_self = 1 ORDER BY rowid LIMIT 1",
                 [],
                 |row| row.get(0),
             )
             .optional()?;
-        let existing_key: Option<String> = self
-            .connection
+        let existing_key: Option<String> = tx
             .query_row(
                 "SELECT id FROM devices WHERE public_key = ?1 ORDER BY rowid LIMIT 1",
                 [public_key],
@@ -630,19 +638,19 @@ impl Store {
         let id = existing_self
             .or(existing_key)
             .unwrap_or_else(|| Id::generate().0);
-        let updated = self.connection.execute(
+        let updated = tx.execute(
             "UPDATE devices SET label = ?1, public_key = ?2, is_self = 1 WHERE id = ?3",
             params![label, public_key, id],
         )?;
         if updated == 0 {
-            self.connection.execute(
+            tx.execute(
                 "INSERT INTO devices(id, label, public_key, is_self, paired_at)
                  VALUES (?1, ?2, ?3, 1, ?4)",
                 params![id, label, public_key, timestamp()],
             )?;
         }
-        self.connection
-            .execute("DELETE FROM devices WHERE is_self = 1 AND id != ?1", [&id])?;
+        tx.execute("DELETE FROM devices WHERE is_self = 1 AND id != ?1", [&id])?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -669,8 +677,10 @@ impl Store {
 
     /// Record a successfully paired peer without ever changing the self-device row.
     pub fn upsert_paired_device(&self, label: &str, public_key: &[u8]) -> Result<String> {
-        let existing: Option<(String, bool)> = self
-            .connection
+        // One transaction so the lookup and the insert/update cannot interleave with another
+        // process and produce two rows for the same peer public key.
+        let tx = self.connection.unchecked_transaction()?;
+        let existing: Option<(String, bool)> = tx
             .query_row(
                 "SELECT id, is_self FROM devices WHERE public_key = ?1 ORDER BY rowid LIMIT 1",
                 [public_key],
@@ -681,18 +691,20 @@ impl Store {
             return Err(StoreError::CannotPairSelf);
         }
         if let Some((id, false)) = existing {
-            self.connection.execute(
+            tx.execute(
                 "UPDATE devices SET label = ?1, paired_at = ?2 WHERE id = ?3",
                 params![label, timestamp(), id],
             )?;
+            tx.commit()?;
             return Ok(id);
         }
         let id = Id::generate().0;
-        self.connection.execute(
+        tx.execute(
             "INSERT INTO devices(id, label, public_key, is_self, paired_at)
              VALUES (?1, ?2, ?3, 0, ?4)",
             params![id, label, public_key, timestamp()],
         )?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -852,7 +864,13 @@ pub fn unix_nanos_from_timestamp(timestamp: &str) -> Option<i128> {
         Some((date, time)) => {
             let (year, month, day) = parse_triplet(date, '-')?;
             let (hour, minute, second) = parse_triplet(time, ':')?;
-            if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+            // Bound the year to keep `unix_days_from_civil`'s i64 arithmetic far from
+            // overflow: a crafted timestamp must return None, never panic or wrap. All real
+            // timestamps this parses are 4-digit-year civil dates written by `timestamp`.
+            if !(1..=9999).contains(&year) || !(1..=12).contains(&month) {
+                return None;
+            }
+            if day < 1 || day > days_in_month(year, month) {
                 return None;
             }
             if hour > 23 || minute > 59 || second > 59 {
@@ -867,6 +885,20 @@ pub fn unix_nanos_from_timestamp(timestamp: &str) -> Option<i128> {
         None => head.parse::<i64>().ok()? as i128,
     };
     Some(seconds * 1_000_000_000 + nanos)
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 fn parse_triplet(text: &str, separator: char) -> Option<(i64, i64, i64)> {
@@ -1009,8 +1041,27 @@ mod tests {
             "2026-13-01T00:00:00.000000000Z", // month out of range
             "2026-07-14T25:00:00.000000000Z", // hour out of range
             "2026-07-14T19:27:16.358278100",  // no trailing Z
+            "2026-02-30T00:00:00.000000000Z", // February never has 30 days
+            "2025-02-29T00:00:00.000000000Z", // 2025 is not a leap year
+            "2026-04-31T00:00:00.000000000Z", // April has 30 days
+            "2026-00-10T00:00:00.000000000Z", // month zero
+            "2026-07-00T00:00:00.000000000Z", // day zero
+            "999999999999-01-01T00:00:00.000000000Z", // year would overflow the day math
         ] {
             assert_eq!(unix_nanos_from_timestamp(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn real_leap_days_still_parse() {
+        // The validation must not reject genuine dates, including leap-year February 29.
+        for good in [
+            "2024-02-29T12:00:00.000000000Z", // 2024 is a leap year
+            "2000-02-29T00:00:00.000000000Z", // divisible by 400
+            "2026-01-31T23:59:59.000000000Z",
+            "2026-12-31T00:00:00.000000000Z",
+        ] {
+            assert!(unix_nanos_from_timestamp(good).is_some(), "{good:?}");
         }
     }
 

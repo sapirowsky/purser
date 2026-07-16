@@ -21,9 +21,27 @@ pub fn device_scope() -> Option<String> {
 }
 
 fn scope_from(raw: Option<&str>) -> Option<String> {
-    raw.map(str::trim)
-        .filter(|scope| !scope.is_empty())
-        .map(str::to_owned)
+    let scope = raw.map(str::trim).filter(|scope| !scope.is_empty())?;
+    // The scope becomes a single directory component (Store::open joins it under
+    // `.../purser/devices/`) and a keyring account suffix. Reject anything that could
+    // escape that component. A malformed value must fail loudly, never silently fall back
+    // to the real device — that would let a typo operate on real secrets and databases.
+    assert!(
+        is_safe_scope(scope),
+        "PURSER_DEVICE={scope:?} is not a valid device scope: it must be a single path \
+         component with no separators, drive letters, or `.`/`..`."
+    );
+    Some(scope.to_owned())
+}
+
+/// A device scope must resolve to exactly one path component so it cannot escape the
+/// `devices/` directory or the keyring namespace it is joined into.
+fn is_safe_scope(scope: &str) -> bool {
+    scope != "."
+        && scope != ".."
+        && !scope
+            .chars()
+            .any(|c| c == '/' || c == '\\' || c == ':' || c == '\0' || std::path::is_separator(c))
 }
 
 /// An opaque, permanent identifier (a ULID rendered as text).
@@ -91,6 +109,27 @@ mod tests {
         assert_eq!(scope_from(Some("")), None);
         assert_eq!(scope_from(Some("   ")), None);
         assert_eq!(scope_from(Some(" mac-sim ")), Some("mac-sim".to_owned()));
+    }
+
+    #[test]
+    fn a_dotted_or_traversal_scope_is_rejected() {
+        // These would escape the `devices/<scope>` component the scope is joined into.
+        for bad in ["/etc", r"..\..\real", "a/b", r"a\b", "..", ".", "C:foo", "d:"] {
+            assert!(!is_safe_scope(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn a_plain_component_is_a_valid_scope() {
+        for good in ["mac-sim", "laptop_2", "win.test", "..hidden"] {
+            assert!(is_safe_scope(good), "{good:?} should be accepted");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "not a valid device scope")]
+    fn a_traversal_scope_panics_rather_than_touching_the_real_device() {
+        scope_from(Some("../real"));
     }
 
     #[test]

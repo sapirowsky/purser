@@ -139,7 +139,24 @@ where
             "CONFLICT: edits to project {}; last writer wins",
             payload.name
         ));
-        if order.is_gt() {
+        // Equal instants must resolve identically on every peer, or the manifest diverges.
+        // Break the tie on the portable fields both devices hold (never on local_path, which
+        // is device-local and unsynced) so each peer picks the same winner.
+        let incoming_key = (
+            payload.name.as_str(),
+            payload.git_remote.as_deref(),
+            payload.branch.as_deref(),
+            payload.package_manager.as_deref(),
+            payload.profile_ref.as_deref(),
+        );
+        let local_key = (
+            existing.name.as_str(),
+            existing.git_remote.as_deref(),
+            existing.branch.as_deref(),
+            existing.package_manager.as_deref(),
+            existing.profile_ref.as_deref(),
+        );
+        if order.then_with(|| incoming_key.cmp(&local_key)).is_gt() {
             store.update_synced_project(&payload.as_sync_project())?;
             summary.received += 1;
         } else {

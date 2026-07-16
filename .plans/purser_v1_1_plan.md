@@ -124,16 +124,16 @@ machine, which makes it the cheaper place to solve it first.
 
 ```text
 CLAUDE — path is the INDEX KEY (a directory name)
-  ~/.claude/projects/C--Users-sapir-Desktop-purser/
+  ~/.claude/projects/C--Users-you-Desktop-purser/
       <session-uuid>.jsonl        transcripts (the path appears ~148x inside one file)
       <session-uuid>/             per-session dir
       memory/                     project memory
   ~/.claude/history.jsonl         GLOBAL, one line per command:
-                                  {"display":"...","project":"C:\\Users\\sapir\\Desktop\\museo",...}
+                                  {"display":"...","project":"C:\\Users\\you\\Desktop\\museo",...}
 
 CODEX — path is a FIELD INSIDE date-partitioned files
   ~/.codex/sessions/2026/02/06/rollout-<ts>-<uuid>.jsonl
-      first line: {"type":"session_meta","payload":{"cwd":"c:\\Users\\sapir\\Desktop\\museo",...}}
+      first line: {"type":"session_meta","payload":{"cwd":"c:\\Users\\you\\Desktop\\museo",...}}
   ~/.codex/history.jsonl, session_index.jsonl
   ~/.codex/logs_2.sqlite (+ -wal, -shm)   LIVE DB — never touch mid-write
 ```
@@ -145,7 +145,7 @@ There is no single mechanism.
 
 ### 1. The Claude encoding is AMBIGUOUS — never decode it
 
-`C--Users-sapir-Desktop-museo-copy` could mean `Desktop\museo-copy` **or** `Desktop\museo\copy`.
+`C--Users-you-Desktop-museo-copy` could mean `Desktop\museo-copy` **or** `Desktop\museo\copy`.
 Separators become `-`, and a literal `-` in a folder name is left alone, so the mapping is
 lossy. Both spellings were observed in this machine's `~/.claude/projects`.
 
@@ -156,7 +156,7 @@ RULE: map FORWARD only (path -> key). Never parse a key back into a path.
 
 ### 2. Case is not consistent
 
-Observed side by side: `C--Users-sapir-Desktop-museo-copy` and `c--Users-sapir-Desktop-museo`.
+Observed side by side: `C--Users-you-Desktop-museo-copy` and `c--Users-you-Desktop-museo`.
 Codex writes `"cwd":"c:\\Users\\..."` with a lowercase drive letter. Windows paths are
 case-insensitive; these keys are byte strings.
 
@@ -167,7 +167,7 @@ RULE: match paths case-insensitively on Windows; preserve whatever case is found
 
 ### 3. A live session is being appended to RIGHT NOW
 
-`~/.claude/projects/C--Users-sapir-Desktop-purser/5af05d7c-....jsonl` was mtime-current while
+`~/.claude/projects/C--Users-you-Desktop-purser/5af05d7c-....jsonl` was mtime-current while
 this plan was written — that is this conversation. Codex holds `logs_2.sqlite` open with a WAL.
 
 ```text

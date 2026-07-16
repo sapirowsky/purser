@@ -13,7 +13,7 @@ one_line: "Where Purser stands and exactly what to do next."
 and it is on the other. That was the whole point of the project.
 
 - **Published:** `purser` 0.0.2 on crates.io (+ `purser-core`, `purser-vault`, `purser-store`).
-  Repo: `github.com/sapirowsky/purser`, tagged `v0.0.2`. Code at `C:\Users\sapir\Desktop\purser`.
+  Repo: `github.com/sapirowsky/purser`, tagged `v0.0.2`. Code at `<repo-root>` (this checkout).
 - **Branch `week2-manifest-up`** — unmerged, unreleased. The name is stale: it now carries all
   of Week 3 as well. Rename or merge when convenient; nothing depends on the name.
 
@@ -39,7 +39,7 @@ It has been applied to the real Windows database; existing data survived intact.
 
 ```text
 purser device pair                 # on A: prints a one-time code, 10 min, single use
-purser device pair <CODE>          # on B: enrolls, receives the vault key
+purser device pair --join          # on B: prompts for the code (hidden), receives the vault key
 purser sync serve                  # on A: listen for paired peers
 purser sync --peer <NODE_ID>       # on B: bidirectional exchange (secrets + manifest)
 purser projects-root <PATH>        # per-device; where `up` clones projects it has never seen
@@ -75,19 +75,20 @@ manual dance, and the honest answer is that Purser is a local vault plus `up`.
 ## ▶ START HERE tomorrow
 
 ```text
-1. Pair the Mac. Build on macOS, `purser device pair` on Windows, enter the code on the Mac.
+1. Pair the Mac. Build on macOS, `purser device pair` on Windows, then `purser device pair
+   --join` on the Mac and enter the code at the hidden prompt.
    THIS IS THE REAL TEST. If it works, everything else follows.
 2. Set projects-root on the Mac, `purser sync --peer <windows-node-id>`, then `purser up`.
    The Mac should clone your projects into its own root at its own paths.
 3. Then just use it for a week. That is Gate C′; there is nothing to build to pass it.
 ```
 
-Consider first, before pairing the Mac for real (small, and it touches the riskiest path):
+Done (2026-07-16), before pairing the Mac for real:
 
 ```text
-- Pairing code is a CLI ARGUMENT, so it lands in shell history and is briefly visible in the
-  process list. It is single-use and expires in 10 minutes, but it is the thing that grants
-  the vault key. Reading it from stdin instead is a small change. Decide before, not after.
+- The pairing code is no longer a CLI argument. `purser device pair --join` reads it from a
+  hidden prompt (or stdin when piped), so the code that grants the vault key never lands in
+  shell history or the process list. Hosting stays `purser device pair` (no secret).
 ```
 
 ## Known limitations — real, not theoretical
@@ -121,8 +122,16 @@ Keyring: device-key:<name>.purser  /  vault-key:<name>.purser
 Without it, every process here is the same device and pairing fails with iroh's
 "Connecting to ourself is not supported". Cleanup after testing:
 
+```powershell
+# PowerShell
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\purser\devices\<name>"
+```
+
 ```text
-rm -rf %LOCALAPPDATA%\purser\devices\<name>
+:: cmd
+rmdir /s /q "%LOCALAPPDATA%\purser\devices\<name>"
+
+:: cmdkey is a cmd builtin; it also runs from PowerShell
 cmdkey /delete:device-key:<name>.purser
 cmdkey /delete:vault-key:<name>.purser
 ```
