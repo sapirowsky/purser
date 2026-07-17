@@ -1,0 +1,11 @@
+{
+  "name": "@getpurser/purser",
+  "version": "0.0.1",
+  "description": "purser — one command sets up any of your machines; secrets sync p2p, invisible to AI agents. Placeholder until first release.",
+  "bin": { "purser": "cli.js" },
+  "files": ["cli.js"],
+  "repository": { "type": "git", "url": "git+https://github.com/sapirowsky/purser.git" },
+  "homepage": "https://github.com/sapirowsky/purser#readme",
+  "license": "MIT",
+  "publishConfig": { "access": "public" }
+}

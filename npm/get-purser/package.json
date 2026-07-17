@@ -1,0 +1,10 @@
+{
+  "name": "get-purser",
+  "version": "0.0.1",
+  "description": "Installer shim for purser — one command sets up any of your machines. Placeholder until first release.",
+  "bin": { "get-purser": "cli.js" },
+  "files": ["cli.js"],
+  "repository": { "type": "git", "url": "git+https://github.com/sapirowsky/purser.git" },
+  "homepage": "https://github.com/sapirowsky/purser#readme",
+  "license": "MIT"
+}
