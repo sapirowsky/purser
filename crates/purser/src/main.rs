@@ -6,13 +6,16 @@ mod secret_sync;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use purser_repo_sync::{bind_with_alpns, device_ref_namespace, serve_git_connection, GIT_ALPN};
 use purser_store::{AuditEvent, Project, Store};
+#[cfg(test)]
+use purser_sync::accept_sync;
 use purser_sync::{
-    accept_pairing, accept_sync, bind_pairing, bind_sync, connect_pairing, connect_sync,
-    request_pairing, serve_pairing, IrohTransport, PairingCode, PairingKeyMaterial, Record,
-    SyncConnection, Transport,
+    accept_pairing, bind_pairing, bind_sync, connect_pairing, connect_sync, request_pairing,
+    serve_pairing, IrohTransport, PairingCode, PairingKeyMaterial, Record, SyncConnection,
+    Transport, SYNC_ALPN,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -58,7 +61,7 @@ enum TopCommand {
     Project(ProjectArgs),
     /// Inspect this device or prove peer-to-peer connectivity.
     Device(DeviceArgs),
-    /// Replicate encrypted secrets and project manifests with a paired device.
+    /// Replicate metadata, or serve metadata and read-only Git fetches to paired devices.
     Sync(SyncArgs),
     /// Set or print the device-local directory used for newly cloned projects.
     ProjectsRoot(ProjectsRootArgs),
@@ -147,6 +150,8 @@ enum ProjectCommand {
     Add(ProjectAddArgs),
     /// Unregister a project. Its files and secrets are left alone.
     Remove(ProjectRemoveArgs),
+    /// Fetch committed Git history from a paired device without changing local branches.
+    Sync(ProjectSyncArgs),
 }
 
 #[derive(Debug, Args)]
@@ -161,6 +166,15 @@ struct ProjectAddArgs {
 struct ProjectRemoveArgs {
     #[arg(default_value = ".")]
     path: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct ProjectSyncArgs {
+    /// Registered project name or opaque project ID.
+    project: String,
+    /// Exact paired-device label or public key.
+    #[arg(long, value_name = "DEVICE")]
+    from: String,
 }
 
 #[derive(Args)]
@@ -214,7 +228,7 @@ struct SyncArgs {
 
 #[derive(Debug, Subcommand)]
 enum SyncCommand {
-    /// Serve paired peers until Ctrl-C.
+    /// Serve paired metadata sync and read-only Git fetch peers until Ctrl-C.
     Serve,
 }
 
@@ -335,7 +349,7 @@ async fn sync_async(args: SyncArgs) -> Result<i32> {
 }
 
 async fn sync_serve(key: iroh::SecretKey) -> Result<()> {
-    let endpoint = bind_sync(key).await?;
+    let endpoint = bind_with_alpns(key, vec![SYNC_ALPN.to_vec(), GIT_ALPN.to_vec()]).await?;
     if tokio::time::timeout(Duration::from_secs(15), endpoint.online())
         .await
         .is_err()
@@ -347,32 +361,57 @@ async fn sync_serve(key: iroh::SecretKey) -> Result<()> {
 
     loop {
         tokio::select! {
-            result = accept_sync(&endpoint) => {
+            result = endpoint.accept() => {
                 match result {
-                    Ok(connection) => {
-                        let peer = connection.peer_id();
-                        let authorized = Store::open()?
-                            .find_device_by_public_key(peer.as_bytes())?
-                            .is_some_and(|device| !device.is_self && !device.revoked);
-                        if !authorized {
-                            connection.refuse();
-                            eprintln!("warning: refused unpaired sync peer {peer}; no records sent");
-                            continue;
-                        }
-                        tokio::select! {
-                            result = serve_sync_connection(connection) => {
-                                if let Err(error) = result {
-                                    eprintln!("warning: paired peer {peer} sync failed: {error:#}");
-                                }
+                    Some(incoming) => {
+                        let connection = match incoming.await {
+                            Ok(connection) => connection,
+                            Err(error) => {
+                                eprintln!("warning: incoming authenticated handshake failed: {error:#}");
+                                continue;
                             }
-                            result = tokio::signal::ctrl_c() => {
-                                result.context("could not listen for Ctrl-C")?;
-                                break;
+                        };
+                        let peer = connection.remote_id();
+                        match connection.alpn() {
+                            SYNC_ALPN => {
+                                let connection = SyncConnection::from_connection(connection)?;
+                                let authorized = Store::open()?
+                                    .find_device_by_public_key(peer.as_bytes())?
+                                    .is_some_and(|device| !device.is_self && !device.revoked);
+                                if !authorized {
+                                    connection.refuse();
+                                    eprintln!("warning: refused unpaired sync peer {peer}; no records sent");
+                                    continue;
+                                }
+                                tokio::select! {
+                                    result = serve_sync_connection(connection) => {
+                                        if let Err(error) = result {
+                                            eprintln!("warning: paired peer {peer} sync failed: {error:#}");
+                                        }
+                                    }
+                                    result = tokio::signal::ctrl_c() => {
+                                        result.context("could not listen for Ctrl-C")?;
+                                        break;
+                                    }
+                                }
+                            },
+                            GIT_ALPN => {
+                                let Some(git) = resolve_program("git") else {
+                                    connection.close(0_u8.into(), b"Git service unavailable");
+                                    eprintln!("warning: refused Git request because git is unavailable");
+                                    continue;
+                                };
+                                if let Err(error) = serve_git_connection(connection, Store::open()?, &git).await {
+                                    eprintln!("warning: Git request from {peer} was refused or failed: {error:#}");
+                                }
+                            },
+                            _ => {
+                                connection.close(0_u8.into(), b"unsupported protocol");
                             }
                         }
                     }
-                    Err(error) => {
-                        eprintln!("warning: incoming sync handshake failed: {error:#}");
+                    None => {
+                        bail!("the iroh service endpoint closed while listening");
                     }
                 }
             }
@@ -839,6 +878,7 @@ fn project(args: ProjectArgs) -> Result<i32> {
     match args.command {
         ProjectCommand::Add(args) => project_add(args),
         ProjectCommand::Remove(args) => project_remove(args),
+        ProjectCommand::Sync(args) => project_sync(args),
     }
 }
 
@@ -862,6 +902,242 @@ fn project_remove(args: ProjectRemoveArgs) -> Result<i32> {
     } else {
         bail!("no project is registered at {}", path.display());
     }
+}
+
+fn project_sync(args: ProjectSyncArgs) -> Result<i32> {
+    let store = Store::open()?;
+    let project = resolve_project_argument(&store, &args.project)?;
+    let device = resolve_device_argument(&store, &args.from)?;
+    if device.is_self {
+        bail!("cannot fetch a project from this device itself");
+    }
+    if device.revoked {
+        bail!("device {:?} is revoked", device.label);
+    }
+    let peer = iroh::PublicKey::try_from(device.public_key.as_slice())
+        .context("the selected device has an invalid public key")?;
+    let path = project
+        .local_path
+        .as_deref()
+        .map(Path::new)
+        .context("the project has no registered local path on this device")?;
+    validate_local_git_repository(path)?;
+    purser_repo_sync::validate_project_id(&project.id)
+        .context("the registered project has an invalid opaque ID")?;
+
+    let namespace = device_ref_namespace(&device.label, &peer)?;
+    let branch_prefix = format!("refs/remotes/purser/{namespace}/");
+    let tag_prefix = format!("refs/purser/{namespace}/tags/");
+    let before_branches = git_refs(path, &branch_prefix)?;
+    let before_tags = git_refs(path, &tag_prefix)?;
+    let local_heads_before = git_refs(path, "refs/heads/")?;
+    let head_before = git_optional_output(path, &["rev-parse", "--verify", "HEAD"]);
+    let symbolic_head_before = git_optional_output(path, &["symbolic-ref", "-q", "HEAD"]);
+    let dirty = !git_readonly_output(
+        path,
+        &["status", "--porcelain=v1", "--untracked-files=normal"],
+    )?
+    .is_empty();
+
+    let remote = format!("purser::{peer}/{}", project.id);
+    let branch_refspec = format!("+refs/heads/*:{branch_prefix}*");
+    let tag_refspec = format!("+refs/tags/*:{tag_prefix}*");
+    let mut command = program_command("git")?;
+    command
+        .arg("-C")
+        .arg(path)
+        .args(["-c", "protocol.version=2", "fetch"])
+        .args([
+            "--quiet",
+            "--no-write-fetch-head",
+            "--no-tags",
+            "--no-recurse-submodules",
+            "--no-auto-maintenance",
+        ])
+        .arg(&remote)
+        .arg(&branch_refspec)
+        .arg(&tag_refspec)
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    prepend_executable_directory_to_path(&mut command)?;
+    run_command(&mut command, "read-only peer Git fetch")?;
+
+    let after_branches = git_refs(path, &branch_prefix)?;
+    let after_tags = git_refs(path, &tag_prefix)?;
+    let local_heads_after = git_refs(path, "refs/heads/")?;
+    let head_after = git_optional_output(path, &["rev-parse", "--verify", "HEAD"]);
+    let symbolic_head_after = git_optional_output(path, &["symbolic-ref", "-q", "HEAD"]);
+    if local_heads_before != local_heads_after
+        || head_before != head_after
+        || symbolic_head_before != symbolic_head_after
+    {
+        bail!("safety check failed: a local branch or HEAD changed during peer fetch");
+    }
+
+    let imported_branches = changed_ref_names(&before_branches, &after_branches, &branch_prefix);
+    let imported_tags = changed_ref_names(&before_tags, &after_tags, &tag_prefix);
+    println!("Source device: {} ({})", device.label, short_node_id(&peer));
+    println!("Project: {} ({})", project.name, project.id);
+    println!("Branches imported: {}", display_names(&imported_branches));
+    println!("Tags imported: {}", display_names(&imported_tags));
+    for (reference, remote_commit) in &after_branches {
+        let branch = reference
+            .strip_prefix(&branch_prefix)
+            .expect("queried branch prefix");
+        let local_reference = format!("refs/heads/{branch}");
+        let status = match local_heads_after.get(&local_reference) {
+            None => "no local branch",
+            Some(local_commit) if local_commit == remote_commit => "same",
+            Some(local_commit) if git_is_ancestor(path, local_commit, remote_commit)? => "behind",
+            Some(local_commit) if git_is_ancestor(path, remote_commit, local_commit)? => "ahead",
+            Some(_) => "diverged",
+        };
+        println!("  {branch}: {status}");
+    }
+    println!(
+        "Working tree dirty before fetch: {}",
+        if dirty { "yes" } else { "no" }
+    );
+    println!("No local branch, HEAD, index, or working-tree file was changed.");
+    Ok(0)
+}
+
+fn resolve_project_argument(store: &Store, value: &str) -> Result<Project> {
+    if let Some(project) = store.find_project_by_id(value)? {
+        return Ok(project);
+    }
+    let matches: Vec<_> = store
+        .list_projects()?
+        .into_iter()
+        .filter(|project| project.name == value)
+        .collect();
+    match matches.len() {
+        0 => bail!("unknown registered project {value:?}"),
+        1 => Ok(matches.into_iter().next().expect("one project")),
+        _ => bail!("project name {value:?} is ambiguous; use its opaque project ID"),
+    }
+}
+
+fn resolve_device_argument(store: &Store, value: &str) -> Result<purser_store::Device> {
+    if let Ok(peer) = value.parse::<iroh::PublicKey>() {
+        if let Some(device) = store.find_device_by_public_key(peer.as_bytes())? {
+            return Ok(device);
+        }
+    }
+    let matches: Vec<_> = store
+        .list_devices()?
+        .into_iter()
+        .filter(|device| device.label == value)
+        .collect();
+    match matches.len() {
+        0 => bail!("unknown or unpaired device {value:?}"),
+        1 => Ok(matches.into_iter().next().expect("one device")),
+        _ => bail!("device label {value:?} is ambiguous; use its public key"),
+    }
+}
+
+fn validate_local_git_repository(path: &Path) -> Result<()> {
+    if !path.is_dir() {
+        bail!("the registered project path is not a directory");
+    }
+    git_readonly_output(path, &["rev-parse", "--git-dir"])
+        .context("the registered project path is not a Git repository")?;
+    Ok(())
+}
+
+fn git_readonly_output(path: &Path, arguments: &[&str]) -> Result<String> {
+    let mut command = program_command("git")?;
+    let output = command
+        .arg("-C")
+        .arg(path)
+        .args(arguments)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stderr(Stdio::null())
+        .output()
+        .context("could not run a read-only Git query")?;
+    if !output.status.success() {
+        bail!("read-only Git query failed");
+    }
+    Ok(String::from_utf8(output.stdout)
+        .context("Git query output was not valid UTF-8")?
+        .trim()
+        .to_owned())
+}
+
+fn git_optional_output(path: &Path, arguments: &[&str]) -> Option<String> {
+    git_readonly_output(path, arguments).ok()
+}
+
+fn git_refs(path: &Path, prefix: &str) -> Result<BTreeMap<String, String>> {
+    let output = git_readonly_output(
+        path,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%09%(objectname)",
+            prefix,
+        ],
+    )?;
+    let mut refs = BTreeMap::new();
+    for line in output.lines().filter(|line| !line.is_empty()) {
+        let (name, object) = line
+            .split_once('\t')
+            .ok_or_else(|| anyhow!("Git returned a malformed ref listing"))?;
+        refs.insert(name.to_owned(), object.to_owned());
+    }
+    Ok(refs)
+}
+
+fn changed_ref_names(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+    prefix: &str,
+) -> Vec<String> {
+    after
+        .iter()
+        .filter(|(name, object)| before.get(*name) != Some(*object))
+        .map(|(name, _)| name.strip_prefix(prefix).unwrap_or(name).to_owned())
+        .collect()
+}
+
+fn display_names(names: &[String]) -> String {
+    if names.is_empty() {
+        "none".to_owned()
+    } else {
+        names.join(", ")
+    }
+}
+
+fn git_is_ancestor(path: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let mut command = program_command("git")?;
+    let status = command
+        .arg("-C")
+        .arg(path)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("could not compare Git histories")?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => bail!("could not compare Git histories"),
+    }
+}
+
+fn prepend_executable_directory_to_path(command: &mut Command) -> Result<()> {
+    let executable = std::env::current_exe().context("could not locate the Purser executable")?;
+    let directory = executable
+        .parent()
+        .context("Purser executable has no parent directory")?;
+    let mut paths = vec![directory.to_owned()];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    command.env(
+        "PATH",
+        std::env::join_paths(paths).context("could not construct the helper search path")?,
+    );
+    Ok(())
 }
 
 /// Absolutize without touching the filesystem, so a deleted directory still resolves.
@@ -1003,8 +1279,10 @@ fn uninstall() -> Result<i32> {
 /// Delete the SQLite database and any journal/WAL sidecars beside it.
 fn remove_database_files(db_path: &Path) -> Result<()> {
     fs::remove_file(db_path).with_context(|| format!("could not remove {}", db_path.display()))?;
-    if let (Some(dir), Some(name)) = (db_path.parent(), db_path.file_name().and_then(|n| n.to_str()))
-    {
+    if let (Some(dir), Some(name)) = (
+        db_path.parent(),
+        db_path.file_name().and_then(|n| n.to_str()),
+    ) {
         for suffix in ["-wal", "-shm", "-journal"] {
             let _ = fs::remove_file(dir.join(format!("{name}{suffix}"))); // best-effort
         }
@@ -2708,6 +2986,43 @@ mod tests {
                 command: None,
             }) if node_id == "node-id"
         ));
+    }
+
+    #[test]
+    fn project_sync_command_and_exact_resolution_are_unambiguous() {
+        let parsed =
+            Cli::try_parse_from(["purser", "project", "sync", "example", "--from", "laptop"])
+                .unwrap();
+        assert!(matches!(
+            parsed.command,
+            TopCommand::Project(ProjectArgs {
+                command: ProjectCommand::Sync(ProjectSyncArgs { project, from }),
+            }) if project == "example" && from == "laptop"
+        ));
+
+        let store = Store::open_in_memory().unwrap();
+        let first_id = store
+            .upsert_project("example", None, None, None, None, "/first/example")
+            .unwrap();
+        store
+            .upsert_project("example", None, None, None, None, "/second/example")
+            .unwrap();
+        assert!(resolve_project_argument(&store, "example")
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous"));
+        assert_eq!(
+            resolve_project_argument(&store, &first_id).unwrap().id,
+            first_id
+        );
+
+        store.upsert_paired_device("laptop", &[0x11; 32]).unwrap();
+        store.upsert_paired_device("laptop", &[0x22; 32]).unwrap();
+        assert!(resolve_device_argument(&store, "laptop")
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous"));
+        assert!(resolve_device_argument(&store, "unknown").is_err());
     }
 
     #[test]

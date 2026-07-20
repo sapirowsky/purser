@@ -2703,6 +2703,7 @@ dependencies = [
  "anyhow",
  "clap",
  "iroh",
+ "purser-repo-sync",
  "purser-store",
  "purser-sync",
  "purser-vault",
@@ -2734,6 +2735,17 @@ name = "purser-mcp"
 version = "0.1.0"
 dependencies = [
  "purser-core",
+]
+
+[[package]]
+name = "purser-repo-sync"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "iroh",
+ "purser-store",
+ "tokio",
+ "ulid",
 ]
 
 [[package]]

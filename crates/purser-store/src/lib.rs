@@ -763,7 +763,13 @@ impl Store {
                 tx.execute(
                     "INSERT INTO devices(id, label, public_key, is_self, paired_at, revoked)
                      VALUES (?1, ?2, ?3, 0, ?4, ?5)",
-                    params![Id::generate().0, label, public_key, paired_at, i64::from(revoked)],
+                    params![
+                        Id::generate().0,
+                        label,
+                        public_key,
+                        paired_at,
+                        i64::from(revoked)
+                    ],
                 )?;
             }
         }
@@ -1120,16 +1126,16 @@ mod tests {
             "",
             "Z",
             "not-a-time",
-            "2026-07-14T19:27:16Z",           // no nanoseconds
-            "2026-07-14T19:27:16.1234Z",      // wrong nanosecond width
-            "2026-13-01T00:00:00.000000000Z", // month out of range
-            "2026-07-14T25:00:00.000000000Z", // hour out of range
-            "2026-07-14T19:27:16.358278100",  // no trailing Z
-            "2026-02-30T00:00:00.000000000Z", // February never has 30 days
-            "2025-02-29T00:00:00.000000000Z", // 2025 is not a leap year
-            "2026-04-31T00:00:00.000000000Z", // April has 30 days
-            "2026-00-10T00:00:00.000000000Z", // month zero
-            "2026-07-00T00:00:00.000000000Z", // day zero
+            "2026-07-14T19:27:16Z",                   // no nanoseconds
+            "2026-07-14T19:27:16.1234Z",              // wrong nanosecond width
+            "2026-13-01T00:00:00.000000000Z",         // month out of range
+            "2026-07-14T25:00:00.000000000Z",         // hour out of range
+            "2026-07-14T19:27:16.358278100",          // no trailing Z
+            "2026-02-30T00:00:00.000000000Z",         // February never has 30 days
+            "2025-02-29T00:00:00.000000000Z",         // 2025 is not a leap year
+            "2026-04-31T00:00:00.000000000Z",         // April has 30 days
+            "2026-00-10T00:00:00.000000000Z",         // month zero
+            "2026-07-00T00:00:00.000000000Z",         // day zero
             "999999999999-01-01T00:00:00.000000000Z", // year would overflow the day math
         ] {
             assert_eq!(unix_nanos_from_timestamp(bad), None, "{bad:?}");
@@ -1241,7 +1247,11 @@ mod tests {
         keys.sort();
         let unique = keys.len();
         keys.dedup();
-        assert_eq!(keys.len(), unique, "public keys must be unique after migration");
+        assert_eq!(
+            keys.len(),
+            unique,
+            "public keys must be unique after migration"
+        );
 
         drop(store);
         std::fs::remove_file(path).unwrap();

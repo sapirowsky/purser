@@ -17,7 +17,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const ALPN: &[u8] = b"purser/transport/1";
 const PAIRING_ALPN: &[u8] = b"purser/pair/1";
-const SYNC_ALPN: &[u8] = b"purser/sync/1";
+pub const SYNC_ALPN: &[u8] = b"purser/sync/1";
 const PAIRING_KDF_INFO: &[u8] = b"purser/pair/1/v1";
 const PAIRING_PROOF_LABEL: &[u8] = b"purser/pair/1/b";
 const KEY_BYTES: usize = 32;
@@ -209,6 +209,14 @@ pub struct SyncConnection {
 }
 
 impl SyncConnection {
+    /// Wrap a connection whose completed handshake negotiated [`SYNC_ALPN`].
+    pub fn from_connection(connection: iroh::endpoint::Connection) -> Result<Self> {
+        if connection.alpn() != SYNC_ALPN {
+            bail!("connection did not negotiate the metadata sync protocol");
+        }
+        Ok(Self { connection })
+    }
+
     pub fn peer_id(&self) -> EndpointId {
         self.connection.remote_id()
     }

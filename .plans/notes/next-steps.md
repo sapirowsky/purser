@@ -1,13 +1,56 @@
 ---
 title: "Next Steps — pick up here"
 status: "active"
-updated: "2026-07-16"
-one_line: "Where Purser stands and exactly what to do next."
+updated: "2026-07-20"
+one_line: "Read-only peer Git fetch is complete; peer-first bootstrap is next."
 ---
 
 # Next Steps — pick up here
 
-## Where it stands (2026-07-16)
+## Where it stands (2026-07-20)
+
+**Physical Windows-to-macOS pairing is proven, the device mesh is implemented, and read-only
+peer-to-peer Git fetch now works.** Metadata and secrets synchronize between paired physical
+devices. Device discovery and revocation bookkeeping are in place through migration 005.
+
+The Git milestone uses the paired device identity and a dedicated `purser/git/1` ALPN:
+
+```text
+purser sync serve
+purser project sync <PROJECT> --from <DEVICE>
+```
+
+`PROJECT` resolves by registered name or opaque ID. `DEVICE` resolves by exact label or public
+key, with ambiguous, self, unknown, unpaired, and revoked devices rejected. The source project
+is addressed only by opaque project ID; peers cannot supply a filesystem path.
+
+The fetch uses Git's native upload-pack negotiation and streams the pack over authenticated iroh
+QUIC. Imported refs are isolated under:
+
+```text
+refs/remotes/purser/<device>/<branch>
+refs/purser/<device>/tags/<tag>
+```
+
+No local branch, `HEAD`, ordinary tag, index entry, or working-tree file is updated. Integration
+tests cover initial and incremental fetch, tags, dirty-tree preservation, divergent local branches,
+authorization failures, and operation without a hosted remote.
+
+### Start here next
+
+Implement **peer-first `purser up` bootstrap** using the read-only peer fetch that now exists.
+Build outputs and dependencies remain local. Do not add push, automatic checkout during
+`project sync`, or working-tree synchronization.
+
+Metadata sync still sends the full state. `sync_state` cursors remain deliberately deferred until
+the state is large enough to justify optimizing the already-correct exchange.
+
+---
+
+## Historical Week 3 snapshot (2026-07-16; superseded where noted)
+
+The notes below preserve the original Week 3 handoff. Its claims that physical Mac testing,
+device mesh, and revocation were still pending are no longer current; use the snapshot above.
 
 **Week 3 is built. Sync works.** Set a secret or register a project on one device, sync,
 and it is on the other. That was the whole point of the project.

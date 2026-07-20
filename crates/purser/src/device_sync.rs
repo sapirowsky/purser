@@ -106,8 +106,8 @@ where
         if record.version != 1 {
             bail!("device sync record has an unsupported version");
         }
-        let mut plaintext =
-            decrypt(&record.ciphertext).context("could not decrypt a device replication payload")?;
+        let mut plaintext = decrypt(&record.ciphertext)
+            .context("could not decrypt a device replication payload")?;
         let payload = decode_payload(&plaintext)?;
         plaintext.zeroize();
         if payload.id != envelope_id {
@@ -218,7 +218,9 @@ mod tests {
     }
 
     fn open(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-        Ok(Zeroizing::new(bytes.iter().map(|byte| byte ^ 0xA5).collect()))
+        Ok(Zeroizing::new(
+            bytes.iter().map(|byte| byte ^ 0xA5).collect(),
+        ))
     }
 
     /// A three-device mesh: A is paired with B and with C, but B and C have never met. When

@@ -10,6 +10,18 @@ Built with Rust. Rust good.
 
 ## What it will do
 
+Read-only peer Git synchronization is available between paired devices:
+
+```text
+purser sync serve
+purser project sync <PROJECT> --from <DEVICE>
+```
+
+`PROJECT` may be a registered name or opaque ID; `DEVICE` may be an exact label or public
+key. The fetch imports objects and writes only `refs/remotes/purser/<device>/*` and
+`refs/purser/<device>/tags/*`. It never checks out, merges, resets, cleans, updates a local
+branch or ordinary tag, or changes the index or working tree. No hosted Git remote is needed.
+
 ```
 purser up                 # reproduce this machine: clone repos, install deps, inject env
 purser agent -- claude    # run an agent that can work but can't see secret values
@@ -29,6 +41,7 @@ crates/
   purser-store   # SQLite migrations + repositories
   purser-vault   # encryption at rest + OS keyring
   purser-sync    # p2p transport (trait), device pairing, replication (seam 3)
+  purser-repo-sync # read-only Git upload-pack transport over authenticated iroh
   purser-daemon  # resident process: injection, MCP endpoint, audit, sync loop
   purser-mcp     # metadata-only MCP tools (no value path exists)
 ```

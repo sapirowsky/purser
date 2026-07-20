@@ -114,7 +114,16 @@ mod tests {
     #[test]
     fn a_dotted_or_traversal_scope_is_rejected() {
         // These would escape the `devices/<scope>` component the scope is joined into.
-        for bad in ["/etc", r"..\..\real", "a/b", r"a\b", "..", ".", "C:foo", "d:"] {
+        for bad in [
+            "/etc",
+            r"..\..\real",
+            "a/b",
+            r"a\b",
+            "..",
+            ".",
+            "C:foo",
+            "d:",
+        ] {
             assert!(!is_safe_scope(bad), "{bad:?} should be rejected");
         }
     }

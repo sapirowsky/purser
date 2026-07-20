@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Read-only peer Git fetch.** `purser project sync <PROJECT> --from <DEVICE>` now fetches
+  branches, tags, commits, and missing objects directly from a paired, non-revoked device
+  over authenticated iroh QUIC (`purser/git/1`). Branches land under
+  `refs/remotes/purser/<device>/` and tags under `refs/purser/<device>/tags/`; local branches,
+  `HEAD`, ordinary tags, the index, and working-tree files are never updated. The installed
+  `git-remote-purser` helper exposes only `git-upload-pack` for
+  `purser::<peer-public-key>/<project-id>` URLs.
 - **Device mesh (v1.1 part 1).** Devices now gossip their device list as a fourth synced
   record type, so any two paired devices learn about every other paired device — no machine
   has to be a hub. Reconciled by public key (not the row id), the self row is never gossiped

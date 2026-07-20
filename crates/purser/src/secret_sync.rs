@@ -567,7 +567,11 @@ mod tests {
         let a_val = open(&a.all_secret_versions_for_sync().unwrap()[0].ciphertext).unwrap();
         let b_val = open(&b.all_secret_versions_for_sync().unwrap()[0].ciphertext).unwrap();
         assert_eq!(a_val[..], b_val[..], "peers must converge on one value");
-        assert_eq!(&a_val[..], b"bbb", "the larger value bytes win deterministically");
+        assert_eq!(
+            &a_val[..],
+            b"bbb",
+            "the larger value bytes win deterministically"
+        );
     }
 
     #[test]

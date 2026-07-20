@@ -1,5 +1,6 @@
 [package]
 name = "purser"
+default-run = "purser"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -18,8 +19,13 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 iroh = { workspace = true }
 purser-store = { workspace = true }
+purser-repo-sync = { workspace = true }
 purser-sync = { workspace = true }
 purser-vault = { workspace = true }
 rpassword = { workspace = true }
 tokio = { workspace = true }
 zeroize = { workspace = true }
+
+[[bin]]
+name = "git-remote-purser"
+path = "src/bin/git-remote-purser.rs"
