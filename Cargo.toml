@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/sapirowsky/purser"
@@ -25,13 +25,13 @@ repository = "https://github.com/sapirowsky/purser"
 # zeroize, rmcp, ulid, clap, notify) get added per-crate as each fills in.
 # See the planning repo: docs/notes/tech-stack.md.
 [workspace.dependencies]
-purser-core = { path = "crates/purser-core", version = "0.1.0" }
-purser-store = { path = "crates/purser-store", version = "0.1.0" }
-purser-vault = { path = "crates/purser-vault", version = "0.1.0" }
-purser-sync = { path = "crates/purser-sync", version = "0.1.0" }
-purser-repo-sync = { path = "crates/purser-repo-sync", version = "0.1.0" }
-purser-daemon = { path = "crates/purser-daemon", version = "0.1.0" }
-purser-mcp = { path = "crates/purser-mcp", version = "0.1.0" }
+purser-core = { path = "crates/purser-core", version = "0.2.0" }
+purser-store = { path = "crates/purser-store", version = "0.2.0" }
+purser-vault = { path = "crates/purser-vault", version = "0.2.0" }
+purser-sync = { path = "crates/purser-sync", version = "0.2.0" }
+purser-repo-sync = { path = "crates/purser-repo-sync", version = "0.2.0" }
+purser-daemon = { path = "crates/purser-daemon", version = "0.2.0" }
+purser-mcp = { path = "crates/purser-mcp", version = "0.2.0" }
 anyhow = "1.0.100"
 base64 = "0.22.1"
 chacha20poly1305 = "0.10.1"

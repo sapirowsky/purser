@@ -2698,7 +2698,7 @@ dependencies = [
 
 [[package]]
 name = "purser"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2714,14 +2714,14 @@ dependencies = [
 
 [[package]]
 name = "purser-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ulid",
 ]
 
 [[package]]
 name = "purser-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "purser-core",
  "purser-mcp",
@@ -2732,14 +2732,14 @@ dependencies = [
 
 [[package]]
 name = "purser-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "purser-core",
 ]
 
 [[package]]
 name = "purser-repo-sync"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "iroh",
@@ -2750,7 +2750,7 @@ dependencies = [
 
 [[package]]
 name = "purser-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dirs",
  "purser-core",
@@ -2761,7 +2761,7 @@ dependencies = [
 
 [[package]]
 name = "purser-sync"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -2778,7 +2778,7 @@ dependencies = [
 
 [[package]]
 name = "purser-vault"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chacha20poly1305",
  "keyring",

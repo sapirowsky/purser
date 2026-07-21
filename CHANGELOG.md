@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-21
+
 ### Added
 
 - **Read-only peer Git fetch.** `purser project sync <PROJECT> --from <DEVICE>` now fetches
@@ -28,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and device keys from the OS keyring), with a keep-or-wipe prompt and a typed-name
   confirmation before any irreversible deletion. Cargo cannot be hooked, so removing the
   binary stays `cargo uninstall purser`; this command handles the data it leaves behind.
+- Reserved the `get-purser` and `@getpurser/purser` npm package names with installer
+  placeholders for a future npm-based distribution.
 
 ## [0.1.0] - 2026-07-16
 
@@ -98,7 +102,8 @@ the `purser-core`, `purser-store`, and `purser-vault` crates alongside the `purs
 
 Initial crates.io publish reserving the `purser` name; Cargo workspace scaffold.
 
-[Unreleased]: https://github.com/sapirowsky/purser/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/sapirowsky/purser/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/sapirowsky/purser/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/sapirowsky/purser/compare/v0.0.2...v0.1.0
 [0.0.2]: https://github.com/sapirowsky/purser/releases/tag/v0.0.2
 [0.0.1]: https://crates.io/crates/purser/0.0.1
